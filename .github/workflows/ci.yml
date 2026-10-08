@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        go: ["1.21", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - run: scripts/test.sh
+
+  # Private sibling repos need a token with read access to them
+  # (secrets.ORDERER_REPO_TOKEN); public ones work with the default token.
+  vendored:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer
+          path: upstream/orderer
+          fetch-depth: 0
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - run: UPSTREAM_DIR=upstream/orderer scripts/vendored.sh
+
+  # Both axes: orderer-go vs orderer-rust and vs matcher-go, via the spec repo's scripts.
+  cross-impl:
+    runs-on: ubuntu-latest
+    env:
+      ORDERER_GO_DIR: ${{ github.workspace }}
+      ORDERER_RUST_DIR: ${{ github.workspace }}/upstream/orderer-rust
+      MATCHER_GO_DIR: ${{ github.workspace }}/upstream/matcher-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer
+          path: upstream/orderer
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/orderer-rust
+          path: upstream/orderer-rust
+          token: ${{ secrets.ORDERER_REPO_TOKEN || github.token }}
+      - uses: actions/checkout@v4
+        with:
+          repository: abhijitkrm/matcher-go
+          ref: 53b222afd1d408a036a0594ee658dde41a6814b0
+          path: upstream/matcher-go
+      - uses: dtolnay/rust-toolchain@stable
+      - run: upstream/orderer/scripts/diffuzz.sh 4 10000
+      - run: upstream/orderer/scripts/e2e.sh
+      - run: upstream/orderer/scripts/snapdiff.sh
