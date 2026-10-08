@@ -25,7 +25,7 @@ package (every non-test `.go` file) at `53b222afd1d408a036a0594ee658dde41a6814b0
 That commit includes one fix found while building orderer-go:
 
 - `53b222a`: `depth` sized its result by the requested count, so
-  `RestingOrders` (which asks for every level) allocated 24 GB per book
+  `RestingOrders` (which asks for every level) allocated 16 GiB per side, per book,
   per snapshot.
 
 matcher-go never had the OrderMap deletion bug fixed in matcher-rust and
