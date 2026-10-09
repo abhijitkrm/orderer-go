@@ -733,7 +733,7 @@ func TestStatsCountCommandsEventsAndFsyncs(t *testing.T) {
 	mustOk(t, p.Drain())
 	lagging := func() bool {
 		for _, s := range p.Stats().Partitions {
-			if s.DurableIseq < s.FlushedIseq {
+			if s.Fsyncs == 0 || s.DurableIseq < s.FlushedIseq {
 				return true
 			}
 		}
