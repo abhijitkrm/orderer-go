@@ -113,6 +113,7 @@ type pipeOpts struct {
 	journal                *orderer.JournalConfig
 	waits                  orderer.Waits
 	ingress, inbox, outbox int
+	stats                  bool
 }
 
 func build(core orderer.CoreFactory, book matcher.BookConfig, o *pipeOpts, m orderer.EgressFactory) *orderer.Pipeline {
@@ -182,6 +183,19 @@ func pipeMode(core orderer.CoreFactory, setup, run *orderer.Corpus, o *pipeOpts)
 	must(p.Drain())
 	r := row{ops: len(run.Cmds), wall: time.Since(wall)}
 	p.SetTimestamps(false)
+	if o.stats {
+		// fsync behaviour of the measured pipeline (spec/BENCH.md doesn't
+		// gate on it; it explains durable rows)
+		var n, tot, mx uint64
+		for _, s := range p.Stats().Partitions {
+			n, tot, mx = n+s.Fsyncs, tot+s.FsyncNsTotal, max(mx, s.FsyncNsMax)
+		}
+		mean := 0.0
+		if n > 0 {
+			mean = float64(tot) / float64(n) / 1e3
+		}
+		fmt.Fprintf(os.Stderr, "stats: fsyncs=%d fsync_mean_us=%.1f fsync_max_us=%.1f\n", n, mean, float64(mx)/1e3)
+	}
 	must(p.Shutdown())
 	for _, m := range results.Results() {
 		r.lat = append(r.lat, m.Latencies...)
@@ -208,10 +222,10 @@ func cpu() string {
 func main() {
 	usage := "orderbench <prefix> --mode core|pipe [--partitions P] [--producers N] [--journal binary|jsonl|off] " +
 		"[--journal-dir DIR] [--fsync N] [--tag NAME] [--core fifo|noop] [--waits relaxed|low] [--batch N] " +
-		"[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS]"
+		"[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS] [--stats]"
 	a := orderer.ParseArgs(os.Args[1:], usage, []string{"--mode", "--partitions", "--producers", "--journal",
 		"--journal-dir", "--fsync", "--tag", "--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox",
-		"--events", "--baseline"}, nil)
+		"--events", "--baseline"}, []string{"--stats"})
 	if len(a.Positional) != 1 {
 		orderer.Die(usage)
 	}
@@ -238,7 +252,8 @@ func main() {
 	case "pipe":
 		o := &pipeOpts{partitions: uint32(a.Num("--partitions", 1, orderer.MaxPartitions)),
 			producers: int(max(a.Num("--producers", 1, 1024), 1)), batch: int(max(a.Num("--batch", 64, 1<<20), 1)),
-			waits: orderer.LowLatencyWaits(), ingress: 1 << 14, inbox: 1 << 12, outbox: 1 << 13}
+			waits: orderer.LowLatencyWaits(), ingress: 1 << 14, inbox: 1 << 12, outbox: 1 << 13,
+			stats: a.Flag("--stats")}
 		o.ingress = int(a.Num("--ingress", uint64(o.ingress), 1<<30))
 		o.inbox = int(a.Num("--inbox", uint64(o.inbox), 1<<30))
 		o.outbox = int(a.Num("--outbox", uint64(o.outbox), 1<<30))
