@@ -15,6 +15,7 @@ package orderer
 // Router, engine and egress goroutines lock their OS threads.
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -316,6 +317,7 @@ type Builder struct {
 	timestamps             bool
 	egressThreads          int
 	initial                *Initial
+	checkpointEvery        time.Duration
 }
 
 // NewBuilder starts a pipeline over cores made by core (NewFifoCore, NewNoopCore, …).
@@ -339,7 +341,13 @@ func (b *Builder) Waits(w Waits) *Builder           { b.waits = w; return b }
 func (b *Builder) Journal(j JournalConfig) *Builder { b.journal = &j; return b }
 func (b *Builder) Egress(f EgressFactory) *Builder  { b.egress = append(b.egress, f); return b }
 func (b *Builder) Timestamps(on bool) *Builder      { b.timestamps = on; return b }
-func (b *Builder) Initial(i Initial) *Builder       { b.initial = &i; return b }
+
+// CheckpointEvery takes a checkpoint (spec/JOURNAL.md §6) every d from a
+// background goroutine. Needs journals; Shutdown stops it first; a failed
+// checkpoint fails the pipeline.
+func (b *Builder) CheckpointEvery(d time.Duration) *Builder { b.checkpointEvery = d; return b }
+
+func (b *Builder) Initial(i Initial) *Builder { b.initial = &i; return b }
 
 // EgressThreads sets the goroutines running the partitions' egress plugs (partition p → p % n).
 func (b *Builder) EgressThreads(n int) *Builder {
@@ -351,12 +359,14 @@ func (b *Builder) EgressThreads(n int) *Builder {
 
 // Pipeline is a running pipeline. Shutdown (or Close) stops it.
 type Pipeline struct {
-	sh      *sharedState
-	pmap    *PartitionMap
-	wg      sync.WaitGroup
-	handle  *Handle
-	ingress disruptor.MultiProducer[CmdMsg]
-	shut    bool
+	sh       *sharedState
+	pmap     *PartitionMap
+	wg       sync.WaitGroup
+	handle   *Handle
+	ingress  disruptor.MultiProducer[CmdMsg]
+	shut     bool
+	ckptStop chan struct{}
+	ckptDone chan struct{}
 }
 
 func (p *Pipeline) Handle() *Handle                               { return newHandle(p.ingress, p.sh) }
@@ -455,6 +465,10 @@ func (p *Pipeline) Shutdown() error {
 		return sh.check()
 	}
 	p.shut = true
+	if p.ckptStop != nil { // a checkpoint in progress finishes first
+		close(p.ckptStop)
+		<-p.ckptDone
+	}
 	sh.closed.Store(true)
 	sh.handlesMu.Lock()
 	flags := make([]*inFlight, 0, len(sh.handles))
@@ -552,6 +566,9 @@ func pow2(n int) bool { return n >= 2 && n&(n-1) == 0 }
 
 // Build starts the pipeline.
 func (b *Builder) Build() (*Pipeline, error) {
+	if b.checkpointEvery > 0 && b.journal == nil {
+		return nil, &Error{ErrConfig, "CheckpointEvery needs journals"}
+	}
 	pmap := b.pmap
 	if pmap == nil {
 		m, err := NewPartitionMap(b.partitions, nil)
@@ -679,7 +696,35 @@ func (b *Builder) Build() (*Pipeline, error) {
 	pl.ingress = ingress
 	pl.spawn("router", func() error { routerLoop(rcons[0], inboxes, pmap, nextIseq); return nil })
 	pl.handle = newHandle(ingress, sh)
+	if b.checkpointEvery > 0 {
+		pl.ckptStop, pl.ckptDone = make(chan struct{}), make(chan struct{})
+		go pl.checkpointLoop(b.checkpointEvery)
+	}
 	return pl, nil
+}
+
+// checkpointLoop checkpoints every d until Shutdown stops it.
+func (p *Pipeline) checkpointLoop(d time.Duration) {
+	defer close(p.ckptDone)
+	t := time.NewTicker(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.ckptStop:
+			return
+		case <-t.C:
+		}
+		if p.sh.failed.Load() {
+			return
+		}
+		if _, err := p.Checkpoint(); err != nil {
+			var pe *Error
+			if !errors.As(err, &pe) || (pe.Kind != ErrClosed && pe.Kind != ErrFailed) {
+				p.sh.fail("checkpoint: " + err.Error())
+			}
+			return
+		}
+	}
 }
 
 // spawn runs body on its own locked OS thread; a returned error or panic fails the pipeline.

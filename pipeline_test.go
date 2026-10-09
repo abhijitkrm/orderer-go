@@ -683,3 +683,42 @@ func TestAppendContinuesTheLastSegmentAfterACheckpoint(t *testing.T) {
 		t.Errorf("%d records; 800 should be checkpointed away", n)
 	}
 }
+
+func TestAutomaticCheckpointsKeepTheDirectoryRecoverable(t *testing.T) {
+	cfg := fuzzCfg()
+	cmds := fuzzCorpus(15, 20000, 8)
+	dir := scratch(t)
+	p, err := NewBuilder(NewFifoCore).BookConfig(cfg).Partitions(3).Journal(jcfg(dir, Binary)).
+		CheckpointEvery(20 * time.Millisecond).Build()
+	mustOk(t, err)
+	for i := 0; i < len(cmds); i += 500 {
+		p.PublishBatch(cmds[i:min(i+500, len(cmds))])
+		time.Sleep(3 * time.Millisecond)
+	}
+	last, err := p.Snapshot()
+	mustOk(t, err)
+	mustOk(t, p.Shutdown())
+	cps := ListCheckpoints(dir, true, ^uint64(0))
+	if len(cps) != 1 || cps[0].Cut == 0 {
+		t.Fatalf("checkpoints %v", cps)
+	}
+	snap, err := ReadSnapshot(cps[0].Path)
+	mustOk(t, err)
+	m, _ := NewPartitionMap(3, nil)
+	rec, err := Recover(NewFifoCore, cfg, m, snap, &JournalSource{dir, Binary}, func(uint32, uint32, uint64, *matcher.Event) {})
+	mustOk(t, err)
+	if rec.LastIseq != uint64(len(cmds)) {
+		t.Fatalf("last iseq %d", rec.LastIseq)
+	}
+	p2, err := NewBuilder(NewFifoCore).BookConfig(rec.Book).PartitionMap(m).Initial(rec.Initial()).Build()
+	mustOk(t, err)
+	s, err := p2.Snapshot()
+	mustOk(t, err)
+	mustOk(t, p2.Shutdown())
+	if s.Body != last.Body {
+		t.Error("the directory recovers the final state")
+	}
+	if _, err := NewBuilder(NewFifoCore).CheckpointEvery(5 * time.Millisecond).Build(); err == nil {
+		t.Error("needs journals")
+	}
+}
