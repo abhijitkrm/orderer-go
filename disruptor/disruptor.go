@@ -137,7 +137,16 @@ func (w *waiter) idle(n *notifier) {
 	s := &w.s
 	switch s.Kind {
 	case BusySpin:
-		spinHint()
+		// Yield the P every 16K idle spins (a few hundred µs): a goroutine
+		// that never yields keeps its P until async preemption (10 ms), which
+		// starves goroutines returning from syscalls (journal fsyncs) once
+		// spinners fill GOMAXPROCS. Gosched returns at once when nothing else
+		// is runnable. Yielding every 1K spins cost the journal-off rows.
+		if w.step++; w.step&(1<<14-1) == 0 {
+			runtime.Gosched()
+		} else {
+			spinHint()
+		}
 	case Yield:
 		if w.step < s.Spin {
 			w.step++
