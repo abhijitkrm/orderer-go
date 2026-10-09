@@ -10,8 +10,8 @@ matcher's spec and corpus.
 
 - **upstream**: `orderer`
 - **repo**: `https://github.com/abhijitkrm/orderer`
-- **commit**: `21bf70c8880e08226d978cacb531522fa7a03b68`
-- **tag**: `orderer-spec/1.2` (draft)
+- **commit**: `6a46583cf1fc3aee1e5c2c935143b14d8d716067`
+- **tag**: `orderer-spec/1.2`, plus matcher `06b5403` (bench docs only)
 - **paths**: `spec=spec vectors=vectors`
 
 `docs/VENDORED.sha256` holds every file's checksum. `scripts/vendored.sh`
@@ -21,8 +21,8 @@ against the pinned commit.
 ## 2. The matching core
 
 `matcher/` is [matcher-go](https://github.com/abhijitkrm/matcher-go)'s root
-package (every non-test `.go` file) at `46852c894e073e721e14202d9360495a91e07cc2`, byte for byte.
-That commit includes two fixes found while building orderer-go:
+package (every non-test `.go` file) at `81542bee88408fb2c0e15c6b470f6786d5e0ff03`, byte for byte.
+That commit includes three fixes found while building orderer-go:
 
 - `53b222a`: `depth` sized its result by the requested count, so
   `RestingOrders` (which asks for every level) allocated 16 GiB per side, per book,
@@ -30,6 +30,7 @@ That commit includes two fixes found while building orderer-go:
 - `46852c8`: events are delivered through one reused `Event` per book
   instead of escaping to the heap: the pipeline's hot path went from 77
   bytes per command to zero.
+- `81542be`: the ladder rescans the next best price through a summary bitmap, and an emptied side resets the cursor at once (it used to scan the whole ladder).
 
 matcher-go never had the OrderMap deletion bug fixed in matcher-rust and
 matcher-cpp; `vectors/regress/001_dense_map_churn` pins that.
@@ -38,7 +39,7 @@ To check it:
 
 ```bash
 for f in ../matcher-go/*.go; do case $f in *_test.go) ;; *) cmp "$f" "matcher/$(basename "$f")";; esac; done
-git -C ../matcher-go diff --stat 46852c894e073e721e14202d9360495a91e07cc2 -- '*.go'
+git -C ../matcher-go diff --stat 81542bee88408fb2c0e15c6b470f6786d5e0ff03 -- '*.go'
 ```
 
 orderer's strict parsing (`flat.go`) wraps the core rather than changing

@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: abhijitkrm/matcher-go
-          ref: 46852c894e073e721e14202d9360495a91e07cc2
+          ref: 81542bee88408fb2c0e15c6b470f6786d5e0ff03
           path: upstream/matcher-go
       - uses: dtolnay/rust-toolchain@stable
       - run: upstream/orderer/scripts/diffuzz.sh 4 10000

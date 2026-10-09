@@ -27,13 +27,16 @@ type levelDepth struct {
 
 // ---- ladder --------------------------------------------------------------
 
+// ladderIndex: direct-indexed levels plus an occupancy bitmap. summary bit w
+// is set iff bits[w] != 0, so rescan skips 4096 empty ticks per word.
 type ladderIndex struct {
-	base   int64
-	side   Side
-	levels []level
-	bits   []uint64
-	count  int
-	best   uint32 // index of best occupied level; NIL when empty
+	base    int64
+	side    Side
+	levels  []level
+	bits    []uint64
+	summary []uint64
+	count   int
+	best    uint32 // index of best occupied level; NIL when empty
 }
 
 func newLadderIndex(side Side, pmin, pmax int64) *ladderIndex {
@@ -42,11 +45,12 @@ func newLadderIndex(side Side, pmin, pmax int64) *ladderIndex {
 		span = 1
 	}
 	li := &ladderIndex{
-		base:   pmin,
-		side:   side,
-		levels: make([]level, span),
-		bits:   make([]uint64, (span+63)/64),
-		best:   NIL,
+		base:    pmin,
+		side:    side,
+		levels:  make([]level, span),
+		bits:    make([]uint64, (span+63)/64),
+		summary: make([]uint64, ((span+63)/64+63)/64),
+		best:    NIL,
 	}
 	for i := range li.levels {
 		li.levels[i] = newLevel() // head/tail must start at NIL, not 0
@@ -80,6 +84,7 @@ func (l *ladderIndex) levelInsert(price int64) *level {
 	lv := &l.levels[i]
 	if lv.empty() {
 		l.bits[i/64] |= 1 << (uint(i) % 64)
+		l.summary[i/4096] |= 1 << (uint(i/64) % 64)
 		l.count++
 		if l.best == NIL ||
 			(l.side == Bid && uint32(i) > l.best) ||
@@ -96,9 +101,15 @@ func (l *ladderIndex) unlinkLevel(price int64) {
 	if lv.head != NIL {
 		return
 	}
-	l.bits[i/64] &^= 1 << (uint(i) % 64)
+	w := i / 64
+	l.bits[w] &^= 1 << (uint(i) % 64)
+	if l.bits[w] == 0 {
+		l.summary[w/64] &^= 1 << (uint(w) % 64)
+	}
 	l.count--
-	if uint32(i) == l.best {
+	if l.count == 0 {
+		l.best = NIL
+	} else if uint32(i) == l.best {
 		l.best = l.rescan(i)
 	}
 }
@@ -106,24 +117,33 @@ func (l *ladderIndex) unlinkLevel(price int64) {
 // rescan finds the next occupied index moving inward from `from` (inclusive):
 // higher for asks, lower for bids.
 func (l *ladderIndex) rescan(from int) uint32 {
+	w := from / 64
 	if l.side == Ask {
-		for i := from; i < len(l.levels); {
-			w := i / 64
-			word := l.bits[w] & (^uint64(0) << (uint(i) % 64))
-			for word != 0 {
-				return uint32(w*64 + bits.TrailingZeros64(word))
+		if word := l.bits[w] & (^uint64(0) << (uint(from) % 64)); word != 0 {
+			return uint32(w*64 + bits.TrailingZeros64(word))
+		}
+		// next non-empty word above w, via the summary
+		for s := w + 1; s < len(l.bits); {
+			sw := s / 64
+			if sword := l.summary[sw] & (^uint64(0) << (uint(s) % 64)); sword != 0 {
+				nw := sw*64 + bits.TrailingZeros64(sword)
+				return uint32(nw*64 + bits.TrailingZeros64(l.bits[nw]))
 			}
-			i = w*64 + 64
+			s = sw*64 + 64
 		}
 		return NIL
 	}
-	for i := from; i >= 0; {
-		w := i / 64
-		word := l.bits[w] & (^uint64(0) >> (63 - uint(i)%64))
-		for word != 0 {
-			return uint32(w*64 + 63 - bits.LeadingZeros64(word))
+	if word := l.bits[w] & (^uint64(0) >> (63 - uint(from)%64)); word != 0 {
+		return uint32(w*64 + 63 - bits.LeadingZeros64(word))
+	}
+	// next non-empty word below w, via the summary
+	for s := w - 1; s >= 0; {
+		sw := s / 64
+		if sword := l.summary[sw] & (^uint64(0) >> (63 - uint(s)%64)); sword != 0 {
+			nw := sw*64 + 63 - bits.LeadingZeros64(sword)
+			return uint32(nw*64 + 63 - bits.LeadingZeros64(l.bits[nw]))
 		}
-		i = w*64 - 1
+		s = sw*64 - 1
 	}
 	return NIL
 }
