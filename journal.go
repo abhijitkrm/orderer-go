@@ -910,6 +910,7 @@ type ChunkWriter struct {
 	f                *os.File
 	fsync            *FsyncPolicy
 	flushed, durable *atomic.Uint64
+	io               *IoStats
 	cs               []chunk
 	cur              int
 	last, records    uint64
@@ -925,8 +926,8 @@ const (
 	rotateChunk = -2
 )
 
-func newChunkWriter(f *os.File, fsync *FsyncPolicy, flushed, durable *atomic.Uint64) *ChunkWriter {
-	w := &ChunkWriter{f: f, fsync: fsync, flushed: flushed, durable: durable, cs: make([]chunk, chunks),
+func newChunkWriter(f *os.File, fsync *FsyncPolicy, flushed, durable *atomic.Uint64, io *IoStats) *ChunkWriter {
+	w := &ChunkWriter{f: f, fsync: fsync, flushed: flushed, durable: durable, io: io, cs: make([]chunk, chunks),
 		toIO: make(chan int, chunks+64), free: make(chan int, chunks+2), done: make(chan struct{}),
 		rotations: make(chan *os.File, 64)}
 	for i := range w.cs {
@@ -1028,10 +1029,12 @@ func (w *ChunkWriter) sync(written uint64) {
 	if w.err.Load() != nil {
 		return
 	}
+	t0 := time.Now()
 	if err := w.f.Sync(); err != nil {
 		w.setErr("journal fsync: " + err.Error())
 		return
 	}
+	w.io.record(uint64(time.Since(t0)))
 	w.durable.Store(written)
 }
 

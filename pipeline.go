@@ -138,6 +138,11 @@ type sharedState struct {
 	alertsMu           sync.Mutex
 	alerts             []func()
 	journal            *JournalConfig
+	counters           []*engineCounters
+	io                 []*IoStats
+	ingressCtl         disruptor.RingControl[CmdMsg]
+	inboxCtl           []disruptor.RingControl[CmdMsg]
+	outboxCtl          []disruptor.RingControl[EvtMsg]
 }
 
 func (sh *sharedState) addAlert(a func()) {
@@ -379,6 +384,38 @@ func (p *Pipeline) BookConfig() matcher.BookConfig                { return p.sh.
 func (p *Pipeline) SetTimestamps(on bool)                         { p.sh.timestamps.Store(on) }
 func (p *Pipeline) DurableIseq(part uint32) uint64                { return p.sh.durable[part].Load() }
 
+// Stats is a point-in-time view of the pipeline (see stats.go).
+func (p *Pipeline) Stats() PipelineStats {
+	sh := p.sh
+	depth := func(pub, con int64) uint64 {
+		if pub > con {
+			return uint64(pub - con)
+		}
+		return 0
+	}
+	st := PipelineStats{IngressDepth: depth(sh.ingressCtl.Published(), sh.ingressCtl.Consumed())}
+	for i := uint32(0); i < sh.partitions; i++ {
+		flushed := uint64(math.MaxUint64)
+		if sh.journal != nil {
+			flushed = sh.flushed[i].Load()
+		}
+		io := sh.io[i]
+		st.Partitions = append(st.Partitions, PartitionStats{
+			Partition:    i,
+			InboxDepth:   depth(sh.inboxCtl[i].Published(), sh.inboxCtl[i].Consumed()),
+			OutboxDepth:  depth(sh.outboxCtl[i].Published(), sh.outboxCtl[i].Consumed()),
+			Commands:     sh.counters[i].commands.Load(),
+			Events:       sh.counters[i].events.Load(),
+			FlushedIseq:  flushed,
+			DurableIseq:  sh.durable[i].Load(),
+			Fsyncs:       io.Fsyncs.Load(),
+			FsyncNsTotal: io.FsyncNsTotal.Load(),
+			FsyncNsMax:   io.FsyncNsMax.Load(),
+		})
+	}
+	return st
+}
+
 // Drain is a barrier: it returns once every command published before the
 // call has been applied and delivered to every egress plug.
 func (p *Pipeline) Drain() error {
@@ -543,6 +580,9 @@ type evtJournal struct {
 	w           *ChunkWriter
 	f           JournalFormat
 	seg         segmenter
+	counters    *engineCounters
+	nCommands   uint64
+	nEvents     uint64
 	lastHandoff time.Time
 }
 
@@ -610,6 +650,7 @@ func (b *Builder) Build() (*Pipeline, error) {
 			d.Store(math.MaxUint64)
 		}
 		sh.flushed, sh.durable = append(sh.flushed, f), append(sh.durable, d)
+		sh.counters, sh.io = append(sh.counters, &engineCounters{}), append(sh.io, &IoStats{})
 	}
 
 	// journals first, so I/O errors surface from Build
@@ -626,12 +667,12 @@ func (b *Builder) Build() (*Pipeline, error) {
 				if f, err = openJournal(jc, KindCmd, i, P, b.book); err != nil {
 					break
 				}
-				cmdW[i] = newChunkWriter(f, &jc.Fsync, sh.flushed[i], sh.durable[i])
+				cmdW[i] = newChunkWriter(f, &jc.Fsync, sh.flushed[i], sh.durable[i], sh.io[i])
 				if jc.Events {
 					if f, err = openJournal(jc, KindEvt, i, P, b.book); err != nil {
 						break
 					}
-					evtW[i] = newChunkWriter(f, nil, &atomic.Uint64{}, &atomic.Uint64{})
+					evtW[i] = newChunkWriter(f, nil, &atomic.Uint64{}, &atomic.Uint64{}, &IoStats{})
 				}
 			}
 		}
@@ -658,6 +699,7 @@ func (b *Builder) Build() (*Pipeline, error) {
 		ib.Consumer(b.waits.Engine)
 		inbox, icons := ib.BuildSingle()
 		ictl := inbox.Control()
+		sh.inboxCtl = append(sh.inboxCtl, ictl)
 		sh.addAlert(ictl.Alert)
 		inboxes[i] = inbox
 
@@ -665,9 +707,10 @@ func (b *Builder) Build() (*Pipeline, error) {
 		ob.Consumer(b.waits.Egress)
 		outbox, ocons := ob.BuildSingle()
 		octl := outbox.Control()
+		sh.outboxCtl = append(sh.outboxCtl, octl)
 		sh.addAlert(octl.Alert)
 
-		eng := &engine{sh: sh, inbox: icons[0], out: outbox, core: cores[i], journal: cmdW[i], fmt: fmtp}
+		eng := &engine{sh: sh, inbox: icons[0], out: outbox, core: cores[i], journal: cmdW[i], fmt: fmtp, counters: sh.counters[i]}
 		if journaled {
 			eng.seg = segmenter{b.journal.Dir, b.journal.Format, KindCmd, i, P, b.book}
 		}
@@ -692,6 +735,7 @@ func (b *Builder) Build() (*Pipeline, error) {
 	rb.Consumer(b.waits.Router)
 	ingress, rcons := rb.BuildMulti()
 	gctl := ingress.Control()
+	sh.ingressCtl = gctl
 	sh.addAlert(gctl.Alert)
 	pl.ingress = ingress
 	pl.spawn("router", func() error { routerLoop(rcons[0], inboxes, pmap, nextIseq); return nil })
@@ -791,10 +835,14 @@ type engine struct {
 	seg         segmenter
 	iseq, tPub  uint64
 	stop, force bool
+	counters    *engineCounters
+	nCommands   uint64
+	nEvents     uint64
 }
 
 // Emit stages one event into the outbox.
 func (e *engine) Emit(sym uint32, seq uint64, ev *matcher.Event) {
+	e.nEvents++
 	s := e.out.Stage()
 	if s == nil {
 		panic("outbox alerted")
@@ -808,6 +856,7 @@ func (e *engine) onCmd(m *CmdMsg, _ int64, eob bool) {
 			e.journal.pushCmd(*e.fmt, m.Iseq, m.Symbol, &m.Cmd)
 		}
 		e.iseq, e.tPub = m.Iseq, m.TPub
+		e.nCommands++
 		e.core.Apply(m.Symbol, &m.Cmd, e)
 	} else {
 		// the new segment starts at this cut, before the snapshot is reported
@@ -852,6 +901,10 @@ func (e *engine) run() error {
 	for {
 		e.force = false
 		n := e.inbox.Poll(h)
+		if n > 0 {
+			e.counters.commands.Store(e.nCommands)
+			e.counters.events.Store(e.nEvents)
+		}
 		if e.stop || e.inbox.IsAlerted() {
 			break
 		}

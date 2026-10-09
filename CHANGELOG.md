@@ -10,6 +10,8 @@
 - `Pipeline.Checkpoint` rotates journals onto segments at a clean cut,
   writes the snapshot durably and removes covered segments. Egress plugs
   may implement `Checkpointer`.
+- `Pipeline.Stats()` (stats.go): ring depths, per-partition counts,
+  watermarks, fsync timings; `PipelineStats.ToPrometheus()`.
 - `Builder.CheckpointEvery(d)`: automatic checkpoints from a background
   goroutine (stopped first at shutdown).
 - `orderrun --checkpoint-every K` and `--durable`; `scripts/test.sh` runs the

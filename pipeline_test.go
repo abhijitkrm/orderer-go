@@ -722,3 +722,45 @@ func TestAutomaticCheckpointsKeepTheDirectoryRecoverable(t *testing.T) {
 		t.Error("needs journals")
 	}
 }
+
+func TestStatsCountCommandsEventsAndFsyncs(t *testing.T) {
+	cfg := fuzzCfg()
+	cmds := fuzzCorpus(16, 5000, 6)
+	dir := scratch(t)
+	p, err := NewBuilder(NewFifoCore).BookConfig(cfg).Partitions(3).Journal(jcfg(dir, Binary)).Build()
+	mustOk(t, err)
+	p.PublishBatch(cmds)
+	mustOk(t, p.Drain())
+	lagging := func() bool {
+		for _, s := range p.Stats().Partitions {
+			if s.DurableIseq < s.FlushedIseq {
+				return true
+			}
+		}
+		return false
+	}
+	for deadline := time.Now().Add(10 * time.Second); lagging() && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	st := p.Stats()
+	if st.IngressDepth != 0 || len(st.Partitions) != 3 {
+		t.Fatalf("stats %+v", st)
+	}
+	var commands, events, durable uint64
+	for _, s := range st.Partitions {
+		if s.InboxDepth != 0 || s.OutboxDepth != 0 || s.Fsyncs == 0 || s.FsyncNsMax == 0 {
+			t.Errorf("partition %+v", s)
+		}
+		commands += s.Commands
+		events += s.Events
+		durable = max(durable, s.DurableIseq)
+	}
+	if commands != uint64(len(cmds)) || events != uint64(len(referenceLines(cfg, cmds))) || durable != uint64(len(cmds)) {
+		t.Errorf("commands %d events %d durable %d", commands, events, durable)
+	}
+	prom := st.ToPrometheus()
+	if !strings.Contains(prom, "# TYPE orderer_commands_total counter") || !strings.Contains(prom, `orderer_inbox_depth{partition="2"} 0`) {
+		t.Error(prom)
+	}
+	mustOk(t, p.Shutdown())
+}
