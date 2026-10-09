@@ -16,6 +16,12 @@ Handle.Publish ─▶ ingress ─▶ router ─┬─▶ inbox[p] ─▶ engine[
                   producer)   route) └─▶ …            apply)
 ```
 
+## Install
+
+```bash
+go get github.com/abhijitkrm/orderer-go@v0.2.0
+```
+
 ## Quick start
 
 ```go

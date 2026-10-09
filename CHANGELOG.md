@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased: orderer-spec/1.2
+## 0.2.0 (orderer-spec/1.2)
 
 - Vendors matcher-go 46852c8: emitting events no longer allocates (77 bytes
   per command to zero; core W6 ~7.5M to ~10-13M ops/s untimed on an M1).
