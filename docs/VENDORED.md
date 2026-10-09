@@ -21,12 +21,15 @@ against the pinned commit.
 ## 2. The matching core
 
 `matcher/` is [matcher-go](https://github.com/abhijitkrm/matcher-go)'s root
-package (every non-test `.go` file) at `53b222afd1d408a036a0594ee658dde41a6814b0`, byte for byte.
-That commit includes one fix found while building orderer-go:
+package (every non-test `.go` file) at `46852c894e073e721e14202d9360495a91e07cc2`, byte for byte.
+That commit includes two fixes found while building orderer-go:
 
 - `53b222a`: `depth` sized its result by the requested count, so
   `RestingOrders` (which asks for every level) allocated 16 GiB per side, per book,
   per snapshot.
+- `46852c8`: events are delivered through one reused `Event` per book
+  instead of escaping to the heap: the pipeline's hot path went from 77
+  bytes per command to zero.
 
 matcher-go never had the OrderMap deletion bug fixed in matcher-rust and
 matcher-cpp; `vectors/regress/001_dense_map_churn` pins that.
@@ -35,7 +38,7 @@ To check it:
 
 ```bash
 for f in ../matcher-go/*.go; do case $f in *_test.go) ;; *) cmp "$f" "matcher/$(basename "$f")";; esac; done
-git -C ../matcher-go diff --stat 53b222afd1d408a036a0594ee658dde41a6814b0 -- '*.go'
+git -C ../matcher-go diff --stat 46852c894e073e721e14202d9360495a91e07cc2 -- '*.go'
 ```
 
 orderer's strict parsing (`flat.go`) wraps the core rather than changing

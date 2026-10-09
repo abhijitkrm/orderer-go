@@ -9,6 +9,7 @@ type OrderBook struct {
 	asks priceIndex
 	seq  uint64
 	cfg  BookConfig
+	ev   Event // the event being delivered: reused, so emitting never allocates
 }
 
 func NewOrderBook(cfg BookConfig) *OrderBook {
@@ -200,8 +201,7 @@ func (b *OrderBook) cross(side Side, hasBound bool, bound int64, taker uint64, q
 			if mqty < q {
 				q = mqty
 			}
-			b.seq++
-			sink.OnEvent(b.seq, &Event{Kind: EvTrade, Maker: mid, Taker: taker, Price: bp, Qty: q})
+			b.emit(sink, Event{Kind: EvTrade, Maker: mid, Taker: taker, Price: bp, Qty: q})
 			lv.total -= q
 			m.qty = mqty - q
 			*qty -= q
@@ -209,8 +209,7 @@ func (b *OrderBook) cross(side Side, hasBound bool, bound int64, taker uint64, q
 				b.pool.levelUnlink(lv, mi)
 				delete(b.omap, mid)
 				b.pool.free(mi)
-				b.seq++
-				sink.OnEvent(b.seq, &Event{Kind: EvClosed, OrderID: mid, Reason: uint8(Filled)})
+				b.emit(sink, Event{Kind: EvClosed, OrderID: mid, Reason: uint8(Filled)})
 			}
 			if *qty == 0 {
 				break
@@ -275,9 +274,13 @@ func (b *OrderBook) fillable(side Side, price int64) uint64 {
 	return b.bids.sumRange(price, hi)
 }
 
+// emit delivers ev with the next seq. The sink gets a pointer to the book's
+// reused event, valid only for the call (Sink's contract), so emitting never
+// allocates.
 func (b *OrderBook) emit(sink Sink, ev Event) {
 	b.seq++
-	sink.OnEvent(b.seq, &ev)
+	b.ev = ev
+	sink.OnEvent(b.seq, &b.ev)
 }
 
 func (b *OrderBook) reject(sink Sink, oid uint64, reason RejectReason) {

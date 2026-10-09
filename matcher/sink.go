@@ -2,6 +2,8 @@ package matcher
 
 // Sink is the engine's only I/O seam: every event flows through it in order
 // with its per-book seq. Journaling, market data, replay all hang off this.
+// ev points at the book's reused event: it is valid only during the call, so
+// copy *ev to keep it.
 type Sink interface {
 	OnEvent(seq uint64, ev *Event)
 }
