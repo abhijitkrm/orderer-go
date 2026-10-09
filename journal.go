@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sort"
@@ -41,19 +42,48 @@ func (k JournalKind) label() string {
 	return "evt"
 }
 
-func (k JournalKind) recordSize() int {
-	if k == KindCmd {
-		return CmdRecord
+// recordSize is the record size in a binary journal of version.
+func (k JournalKind) recordSize(version uint16) int {
+	if version == 1 {
+		return k.payload()
 	}
-	return EvtRecord
+	return k.payload() + 8
+}
+
+// payload is the bytes the checksum covers (the version-1 record).
+func (k JournalKind) payload() int {
+	if k == KindCmd {
+		return CmdRecordV1
+	}
+	return EvtRecordV1
 }
 
 const (
-	Header    = 64
-	CmdRecord = 40
-	EvtRecord = 48
+	Header = 64
+	// Version-2 record sizes (1.2): the version-1 record + CRC-32C + 4 reserved bytes.
+	CmdRecord   = 48
+	EvtRecord   = 56
+	CmdRecordV1 = 40
+	EvtRecordV1 = 48
+	// Version is the binary journal version 1.2 writers produce.
+	Version   = 2
 	maxRecord = 256
 )
+
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// CRC32C is CRC-32C (Castagnoli), spec/JOURNAL.md §2.2.
+func CRC32C(b []byte) uint32 { return crc32.Checksum(b, castagnoli) }
+
+// seal writes a version-2 record's checksum after its payload.
+func seal(r []byte, payload int) {
+	binary.LittleEndian.PutUint32(r[payload:], CRC32C(r[:payload]))
+	binary.LittleEndian.PutUint32(r[payload+4:], 0)
+}
+
+func sealed(r []byte, payload int) bool {
+	return binary.LittleEndian.Uint32(r[payload:]) == CRC32C(r[:payload])
+}
 
 // FsyncMode selects when the I/O goroutine fsyncs. Never observable (spec/PIPELINE.md §8).
 type FsyncMode uint8
@@ -104,13 +134,120 @@ func (e *CorruptJournal) Error() string { return e.Msg }
 
 func corrupt(p, d string) error { return &CorruptJournal{p + ": " + d} }
 
-// JournalPath names partition p's journal of kind k.
-func JournalPath(dir string, k JournalKind, p uint32, f JournalFormat) string {
-	ext := ".journal"
+func extOf(f JournalFormat) string {
 	if f == Binary {
-		ext = ".bin"
+		return ".bin"
 	}
-	return filepath.Join(dir, fmt.Sprintf("%s-%d%s", k.label(), p, ext))
+	return ".journal"
+}
+
+// JournalPath names partition p's segment-0 journal of kind k.
+func JournalPath(dir string, k JournalKind, p uint32, f JournalFormat) string {
+	return SegmentPath(dir, k, p, 0, f)
+}
+
+// SegmentPath names the segment starting after cut start (spec/JOURNAL.md §1).
+func SegmentPath(dir string, k JournalKind, p uint32, start uint64, f JournalFormat) string {
+	if start == 0 {
+		return filepath.Join(dir, fmt.Sprintf("%s-%d%s", k.label(), p, extOf(f)))
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s-%d.%d%s", k.label(), p, start, extOf(f)))
+}
+
+// Segment is one journal segment file.
+type Segment struct {
+	Partition uint32
+	Start     uint64
+	Path      string
+}
+
+func parseUint(s string) (uint64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	return v, err == nil
+}
+
+// ListSegments lists every kind-k segment in dir, sorted by (partition, start).
+func ListSegments(dir string, k JournalKind, f JournalFormat) []Segment {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	prefix, suffix := k.label()+"-", extOf(f)
+	var out []Segment
+	for _, e := range ents {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) || len(name) <= len(prefix)+len(suffix) {
+			continue
+		}
+		mid := name[len(prefix) : len(name)-len(suffix)]
+		ps, ss, dotted := strings.Cut(mid, ".")
+		p, ok := parseUint(ps)
+		if !ok || p > 0xFFFFFFFF {
+			continue
+		}
+		var start uint64
+		if dotted {
+			if start, ok = parseUint(ss); !ok || start == 0 {
+				continue
+			}
+		}
+		out = append(out, Segment{uint32(p), start, filepath.Join(dir, name)})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Partition != out[j].Partition {
+			return out[i].Partition < out[j].Partition
+		}
+		return out[i].Start < out[j].Start
+	})
+	return out
+}
+
+// CheckpointPath is the checkpoint snapshot path for cut n (spec/JOURNAL.md §6).
+func CheckpointPath(dir string, n uint64) string {
+	return filepath.Join(dir, fmt.Sprintf("checkpoint-%d.snap", n))
+}
+
+// Checkpoint is one checkpoint snapshot in a journal directory.
+type Checkpoint struct {
+	Cut  uint64
+	Path string
+}
+
+// ListCheckpoints lists checkpoints with cut below `below`, ascending;
+// complete ones have their sidecar.
+func ListCheckpoints(dir string, complete bool, below uint64) []Checkpoint {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []Checkpoint
+	for _, e := range ents {
+		name := e.Name()
+		if !strings.HasPrefix(name, "checkpoint-") || !strings.HasSuffix(name, ".snap") {
+			continue
+		}
+		n, ok := parseUint(name[len("checkpoint-") : len(name)-len(".snap")])
+		if !ok || n >= below {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if complete {
+			if _, err := os.Stat(MetaPath(path)); err != nil {
+				continue
+			}
+		}
+		out = append(out, Checkpoint{n, path})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Cut < out[j].Cut })
+	return out
 }
 
 // ---- encodings -----------------------------------------------------------------------------
@@ -124,14 +261,14 @@ func binaryHeader(k JournalKind, p, P uint32, b matcher.BookConfig) []byte {
 	h := make([]byte, Header)
 	copy(h, "ORDJ")
 	le := binary.LittleEndian
-	le.PutUint16(h[4:], 1)
+	le.PutUint16(h[4:], Version)
 	h[6] = byte(k)
 	if b.Index == matcher.IndexTree {
 		h[7] = 1
 	}
 	le.PutUint32(h[8:], p)
 	le.PutUint32(h[12:], P)
-	le.PutUint32(h[16:], uint32(k.recordSize()))
+	le.PutUint32(h[16:], uint32(k.recordSize(Version)))
 	le.PutUint64(h[24:], uint64(b.PriceMin))
 	le.PutUint64(h[32:], uint64(b.PriceMax))
 	le.PutUint64(h[40:], uint64(b.MaxOrders))
@@ -147,7 +284,7 @@ func AppendCmdLine(iseq uint64, sym uint32, c *matcher.Command, b []byte) []byte
 	return append(b, '}')
 }
 
-// EncodeCmd writes a 40-byte binary command record.
+// EncodeCmd writes a sealed version-2 binary command record (CmdRecord bytes).
 func EncodeCmd(iseq uint64, sym uint32, c *matcher.Command, r []byte) {
 	le := binary.LittleEndian
 	le.PutUint64(r[0:], iseq)
@@ -168,6 +305,7 @@ func EncodeCmd(iseq uint64, sym uint32, c *matcher.Command, r []byte) {
 	le.PutUint64(r[16:], c.OrderID)
 	le.PutUint64(r[24:], uint64(price))
 	le.PutUint64(r[32:], qty)
+	seal(r, CmdRecordV1)
 }
 
 // CmdRec is one command record.
@@ -198,7 +336,7 @@ func decodeCmd(r []byte) (CmdRec, bool) {
 	return rec, true
 }
 
-// EncodeEvt writes a 48-byte binary event record (spec/JOURNAL.md §3.2).
+// EncodeEvt writes a sealed version-2 binary event record (spec/JOURNAL.md §3.2).
 func EncodeEvt(seq uint64, sym uint32, e *matcher.Event, r []byte) {
 	le := binary.LittleEndian
 	le.PutUint64(r[0:], seq)
@@ -223,6 +361,7 @@ func EncodeEvt(seq uint64, sym uint32, e *matcher.Event, r []byte) {
 	le.PutUint64(r[24:], b)
 	le.PutUint64(r[32:], uint64(c))
 	le.PutUint64(r[40:], d)
+	seal(r, EvtRecordV1)
 }
 
 func decodeEvt(r []byte) (uint64, uint32, matcher.Event, bool) {
@@ -253,16 +392,23 @@ func decodeEvt(r []byte) (uint64, uint32, matcher.Event, bool) {
 
 // ---- reading (recovery) --------------------------------------------------------------------
 
-// JournalHeader is a journal file's header.
+// JournalHeader is a journal file's header. Version is the binary journal
+// version (JSONL reports 2); it is not part of SameHeader.
 type JournalHeader struct {
 	Kind       JournalKind
 	Partition  uint32
 	Partitions uint32
 	Book       matcher.BookConfig
+	Version    uint16
+}
+
+// SameHeader compares everything but the version.
+func (h JournalHeader) SameHeader(o JournalHeader) bool {
+	return h.Kind == o.Kind && h.Partition == o.Partition && h.Partitions == o.Partitions && SameBook(h.Book, o.Book)
 }
 
 func parseJsonlHeader(p, line string) (JournalHeader, error) {
-	var h JournalHeader
+	h := JournalHeader{Version: Version}
 	if f, _ := Get(line, "format"); f != "orderer-journal/1" {
 		return h, corrupt(p, "not an orderer-journal/1 header")
 	}
@@ -311,7 +457,8 @@ func parseBinaryHeader(p string, b []byte) (JournalHeader, error) {
 		return h, corrupt(p, "bad magic")
 	}
 	le := binary.LittleEndian
-	if le.Uint16(b[4:]) != 1 {
+	h.Version = le.Uint16(b[4:])
+	if h.Version != 1 && h.Version != 2 {
 		return h, corrupt(p, "unsupported version")
 	}
 	switch b[6] {
@@ -322,7 +469,7 @@ func parseBinaryHeader(p string, b []byte) (JournalHeader, error) {
 	default:
 		return h, corrupt(p, "bad kind")
 	}
-	if le.Uint32(b[16:]) != uint32(h.Kind.recordSize()) {
+	if le.Uint32(b[16:]) != uint32(h.Kind.recordSize(h.Version)) {
 		return h, corrupt(p, "bad record_size")
 	}
 	if b[7] > 1 {
@@ -358,139 +505,260 @@ func ReadJournalHeader(p string, f JournalFormat) (JournalHeader, error) {
 	return parseJsonlHeader(p, t)
 }
 
-func jsonlLines(p string, b []byte) ([]string, error) {
-	if len(b) > 0 && b[len(b)-1] != '\n' {
-		return nil, corrupt(p, "torn tail (final line has no newline)")
-	}
-	t := string(b)
-	if t == "" {
-		return nil, nil
-	}
-	return strings.Split(t[:len(t)-1], "\n"), nil
+// ReadMode is strict (default) or repair reading (spec/JOURNAL.md §5, §5.1).
+type ReadMode uint8
+
+const (
+	Strict ReadMode = iota
+	Repair
+)
+
+// body is one file's records as byte ranges (binary records already checksum-checked).
+type body struct {
+	header   JournalHeader
+	records  [][2]int // offset, length
+	validLen int      // bytes a repair keeps
 }
 
-// ReadCmdJournal reads one command journal strictly.
+func splitBody(p string, b []byte, f JournalFormat, mode ReadMode) (body, error) {
+	var out body
+	if f == Binary {
+		h, err := parseBinaryHeader(p, b)
+		if err != nil {
+			return out, err
+		}
+		out.header = h
+		size := h.Kind.recordSize(h.Version)
+		n := (len(b) - Header) / size
+		if (len(b)-Header)%size != 0 && mode == Strict {
+			return out, corrupt(p, "torn tail (partial record)")
+		}
+		if h.Version >= 2 {
+			for i := 0; i < n; i++ {
+				at := Header + i*size
+				if !sealed(b[at:at+size], h.Kind.payload()) {
+					if mode == Repair && i+1 == n { // a torn final record (§5.1)
+						n--
+						break
+					}
+					return out, corrupt(p, fmt.Sprintf("record %d: checksum mismatch", i))
+				}
+			}
+		}
+		for i := 0; i < n; i++ {
+			out.records = append(out.records, [2]int{Header + i*size, size})
+		}
+		out.validLen = Header + n*size
+		return out, nil
+	}
+	end := len(b)
+	if end > 0 && b[end-1] != '\n' {
+		if mode == Strict {
+			return out, corrupt(p, "torn tail (final line has no newline)")
+		}
+		for end > 0 && b[end-1] != '\n' {
+			end--
+		}
+	}
+	first := 0
+	for first < end && b[first] != '\n' {
+		first++
+	}
+	h, err := parseJsonlHeader(p, string(b[:first]))
+	if err != nil {
+		return out, err
+	}
+	out.header = h
+	for pos := first + 1; pos < end; {
+		e := pos
+		for b[e] != '\n' {
+			e++
+		}
+		out.records = append(out.records, [2]int{pos, e - pos})
+		pos = e + 1
+	}
+	out.validLen = end
+	return out, nil
+}
+
+func decodeCmds(p string, b []byte, f JournalFormat, bd body) ([]CmdRec, error) {
+	recs := make([]CmdRec, 0, len(bd.records))
+	for i, r := range bd.records {
+		if f == Binary {
+			rec, ok := decodeCmd(b[r[0]:])
+			if !ok {
+				return nil, corrupt(p, fmt.Sprintf("record %d: bad codes", i))
+			}
+			recs = append(recs, rec)
+			continue
+		}
+		l := string(b[r[0] : r[0]+r[1]])
+		iseq, ok1 := U64(l, "iseq")
+		sym, ok2 := U64(l, "symbol")
+		c, ok3 := ParseCommand(l)
+		if !ok1 || !ok2 || sym > 0xFFFFFFFF || !ok3 {
+			return nil, corrupt(p, fmt.Sprintf("line %d: malformed record: %s", i+2, l))
+		}
+		recs = append(recs, CmdRec{iseq, uint32(sym), c})
+	}
+	return recs, nil
+}
+
+func checkIncreasing(p string, recs []CmdRec, after *uint64) error {
+	for _, r := range recs {
+		if after != nil && r.Iseq <= *after {
+			return corrupt(p, fmt.Sprintf("iseq not increasing (%d then %d)", *after, r.Iseq))
+		}
+		v := r.Iseq
+		after = &v
+	}
+	return nil
+}
+
+// ReadCmdJournal reads one command journal file strictly.
 func ReadCmdJournal(p string, f JournalFormat) (JournalHeader, []CmdRec, error) {
 	b, err := readFile(p)
 	if err != nil {
 		return JournalHeader{}, nil, err
 	}
-	var h JournalHeader
-	var recs []CmdRec
-	if f == Binary {
-		if h, err = parseBinaryHeader(p, b); err != nil {
-			return h, nil, err
-		}
-		body := len(b) - Header
-		if body%CmdRecord != 0 {
-			return h, nil, corrupt(p, "torn tail (partial record)")
-		}
-		for i := 0; i < body/CmdRecord; i++ {
-			r, ok := decodeCmd(b[Header+i*CmdRecord:])
-			if !ok {
-				return h, nil, corrupt(p, fmt.Sprintf("record %d: bad codes", i))
-			}
-			recs = append(recs, r)
-		}
-	} else {
-		lines, err := jsonlLines(p, b)
-		if err != nil {
-			return h, nil, err
-		}
-		first := ""
-		if len(lines) > 0 {
-			first = lines[0]
-		}
-		if h, err = parseJsonlHeader(p, first); err != nil {
-			return h, nil, err
-		}
-		for i := 1; i < len(lines); i++ {
-			l := lines[i]
-			iseq, ok1 := U64(l, "iseq")
-			sym, ok2 := U64(l, "symbol")
-			c, ok3 := ParseCommand(l)
-			if !ok1 || !ok2 || sym > 0xFFFFFFFF || !ok3 {
-				return h, nil, corrupt(p, fmt.Sprintf("line %d: malformed record: %s", i+1, l))
-			}
-			recs = append(recs, CmdRec{iseq, uint32(sym), c})
-		}
+	bd, err := splitBody(p, b, f, Strict)
+	if err != nil {
+		return bd.header, nil, err
 	}
-	if h.Kind != KindCmd {
-		return h, nil, corrupt(p, "not a command journal")
+	if bd.header.Kind != KindCmd {
+		return bd.header, nil, corrupt(p, "not a command journal")
 	}
-	for i := 1; i < len(recs); i++ {
-		if recs[i].Iseq <= recs[i-1].Iseq {
-			return h, nil, corrupt(p, fmt.Sprintf("iseq not increasing (%d then %d)", recs[i-1].Iseq, recs[i].Iseq))
-		}
+	recs, err := decodeCmds(p, b, f, bd)
+	if err != nil {
+		return bd.header, nil, err
 	}
-	return h, recs, nil
+	return bd.header, recs, checkIncreasing(p, recs, nil)
 }
 
-// ReadCmdDir reads every partition's command journal in dir.
+// ReadCmdDir reads every partition's command journal in dir, all segments in
+// order (spec/JOURNAL.md §1, §5 step 3).
 func ReadCmdDir(dir string, f JournalFormat) (JournalHeader, [][]CmdRec, error) {
-	first := JournalPath(dir, KindCmd, 0, f)
-	h0, r0, err := ReadCmdJournal(first, f)
+	segs := ListSegments(dir, KindCmd, f)
+	if len(segs) == 0 {
+		return JournalHeader{}, nil, corrupt(JournalPath(dir, KindCmd, 0, f), "no command journal")
+	}
+	h0, err := ReadJournalHeader(segs[0].Path, f)
 	if err != nil {
 		return h0, nil, err
 	}
-	if h0.Partition != 0 {
-		return h0, nil, corrupt(first, "header partition is not 0")
-	}
-	all := [][]CmdRec{r0}
-	for p := uint32(1); p < h0.Partitions; p++ {
-		path := JournalPath(dir, KindCmd, p, f)
-		h, r, err := ReadCmdJournal(path, f)
+	all := make([][]CmdRec, h0.Partitions)
+	seen := make([]bool, h0.Partitions)
+	for _, s := range segs {
+		h, recs, err := ReadCmdJournal(s.Path, f)
 		if err != nil {
 			return h0, nil, err
 		}
-		if h.Partition != p || h.Partitions != h0.Partitions || !SameBook(h.Book, h0.Book) {
-			return h0, nil, corrupt(path, "header does not match its file name, partition count or book config")
+		if h.Partition != s.Partition || s.Partition >= h0.Partitions || h.Partitions != h0.Partitions ||
+			!SameBook(h.Book, h0.Book) {
+			return h0, nil, corrupt(s.Path, "header does not match its file name, partition count or book config")
 		}
-		all = append(all, r)
+		part := all[s.Partition]
+		var after *uint64
+		if len(part) > 0 {
+			after = &part[len(part)-1].Iseq
+		}
+		if err := checkIncreasing(s.Path, recs, after); err != nil {
+			return h0, nil, err
+		}
+		all[s.Partition] = append(part, recs...)
+		seen[s.Partition] = true
+	}
+	for p, ok := range seen {
+		if !ok {
+			return h0, nil, corrupt(JournalPath(dir, KindCmd, uint32(p), f), "partition has no journal")
+		}
 	}
 	return h0, all, nil
 }
 
-// ReadEvtJournal reads an event journal as canonical symbol-tagged lines.
+// ReadEvtJournal reads an event journal file as canonical symbol-tagged lines.
 func ReadEvtJournal(p string, f JournalFormat) ([]string, error) {
 	b, err := readFile(p)
 	if err != nil {
 		return nil, err
 	}
-	var out []string
-	if f == Binary {
-		if _, err := parseBinaryHeader(p, b); err != nil {
-			return nil, err
-		}
-		body := len(b) - Header
-		if body%EvtRecord != 0 {
-			return nil, corrupt(p, "torn tail (partial record)")
-		}
-		var buf []byte
-		for i := 0; i < body/EvtRecord; i++ {
-			seq, sym, e, ok := decodeEvt(b[Header+i*EvtRecord:])
-			if !ok {
-				return nil, corrupt(p, fmt.Sprintf("record %d: bad codes", i))
-			}
-			buf = buf[:0]
-			e.WriteCanonicalSym(seq, sym, &buf)
-			out = append(out, string(buf))
-		}
-		return out, nil
-	}
-	lines, err := jsonlLines(p, b)
+	bd, err := splitBody(p, b, f, Strict)
 	if err != nil {
 		return nil, err
 	}
-	first := ""
-	if len(lines) > 0 {
-		first = lines[0]
+	out := make([]string, 0, len(bd.records))
+	var buf []byte
+	for i, r := range bd.records {
+		if f == Jsonl {
+			out = append(out, string(b[r[0]:r[0]+r[1]]))
+			continue
+		}
+		seq, sym, e, ok := decodeEvt(b[r[0]:])
+		if !ok {
+			return nil, corrupt(p, fmt.Sprintf("record %d: bad codes", i))
+		}
+		buf = buf[:0]
+		e.WriteCanonicalSym(seq, sym, &buf)
+		out = append(out, string(buf))
 	}
-	if _, err := parseJsonlHeader(p, first); err != nil {
-		return nil, err
+	return out, nil
+}
+
+// ReadEvtPartition reads a partition's whole event journal (all segments, in order).
+func ReadEvtPartition(dir string, f JournalFormat, p uint32) ([]string, error) {
+	var out []string
+	for _, s := range ListSegments(dir, KindEvt, f) {
+		if s.Partition == p {
+			l, err := ReadEvtJournal(s.Path, f)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, l...)
+		}
 	}
-	if len(lines) > 1 {
-		out = append(out, lines[1:]...)
+	return out, nil
+}
+
+// Repaired is one truncation RepairDir made.
+type Repaired struct {
+	Path  string
+	Bytes int64
+}
+
+// RepairDir truncates a torn tail off each journal family's last segment, in
+// place (spec/JOURNAL.md §5.1).
+func RepairDir(dir string, f JournalFormat) ([]Repaired, error) {
+	var out []Repaired
+	for _, k := range []JournalKind{KindCmd, KindEvt} {
+		last := map[uint32]string{}
+		var parts []uint32
+		for _, s := range ListSegments(dir, k, f) {
+			if _, ok := last[s.Partition]; !ok {
+				parts = append(parts, s.Partition)
+			}
+			last[s.Partition] = s.Path
+		}
+		for _, p := range parts {
+			path := last[p]
+			b, err := readFile(path)
+			if err != nil {
+				return out, err
+			}
+			bd, err := splitBody(path, b, f, Repair)
+			if err != nil {
+				return out, err
+			}
+			if bd.validLen < len(b) {
+				if err := os.Truncate(path, int64(bd.validLen)); err != nil {
+					return out, corrupt(path, err.Error())
+				}
+				if fh, err := os.OpenFile(path, os.O_WRONLY, 0); err == nil {
+					fh.Sync()
+					fh.Close()
+				}
+				out = append(out, Repaired{path, int64(len(b) - bd.validLen)})
+			}
+		}
 	}
 	return out, nil
 }
@@ -516,36 +784,111 @@ func MergeJournals(parts [][]CmdRec, after uint64) ([]CmdRec, error) {
 
 // ---- writing ---------------------------------------------------------------------------------
 
-// openJournal creates (header written) or opens for append (header checked).
-func openJournal(cfg *JournalConfig, k JournalKind, p, P uint32, book matcher.BookConfig) (*os.File, error) {
-	path := JournalPath(cfg.Dir, k, p, cfg.Format)
-	if cfg.Append {
-		if _, err := os.Stat(path); err == nil {
-			h, err := ReadJournalHeader(path, cfg.Format)
-			if err != nil {
-				return nil, err
-			}
-			if h != (JournalHeader{k, p, P, book}) {
-				return nil, corrupt(path, "header does not match the pipeline")
-			}
-			return os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
-		}
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+// openSegment creates segment `start` (truncating any old file) with its header.
+func openSegment(dir string, f JournalFormat, k JournalKind, p, P uint32, book matcher.BookConfig, start uint64) (*os.File, error) {
+	fh, err := os.OpenFile(SegmentPath(dir, k, p, start, f), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	var h []byte
-	if cfg.Format == Jsonl {
+	if f == Jsonl {
 		h = []byte(jsonlHeader(k, p, P, book))
 	} else {
 		h = binaryHeader(k, p, P, book)
 	}
-	if _, err := f.Write(h); err != nil {
-		f.Close()
+	if _, err := fh.Write(h); err != nil {
+		fh.Close()
 		return nil, err
 	}
-	return f, nil
+	return fh, nil
+}
+
+// openJournal opens, in append mode, the partition's last segment (header
+// checked); otherwise a fresh segment 0.
+func openJournal(cfg *JournalConfig, k JournalKind, p, P uint32, book matcher.BookConfig) (*os.File, error) {
+	if cfg.Append {
+		var last string
+		for _, s := range ListSegments(cfg.Dir, k, cfg.Format) {
+			if s.Partition == p {
+				last = s.Path
+			}
+		}
+		if last != "" {
+			h, err := ReadJournalHeader(last, cfg.Format)
+			if err != nil {
+				return nil, err
+			}
+			if !h.SameHeader(JournalHeader{Kind: k, Partition: p, Partitions: P, Book: book}) {
+				return nil, corrupt(last, "header does not match the pipeline")
+			}
+			if cfg.Format == Binary && h.Version != Version {
+				return nil, corrupt(last, "cannot append to a version-1 journal")
+			}
+			return os.OpenFile(last, os.O_WRONLY|os.O_APPEND, 0o644)
+		}
+	}
+	return openSegment(cfg.Dir, cfg.Format, k, p, P, book, 0)
+}
+
+// removeCheckpointsBelow removes checkpoints with cut below n (body first).
+func removeCheckpointsBelow(dir string, n uint64) error {
+	for _, c := range ListCheckpoints(dir, false, n) {
+		if err := os.Remove(c.Path); err != nil {
+			return err
+		}
+		os.Remove(MetaPath(c.Path))
+	}
+	return nil
+}
+
+// removeSegmentsBelow removes segments that start below n (spec/JOURNAL.md §6 step 4).
+func removeSegmentsBelow(dir string, f JournalFormat, n uint64) error {
+	for _, k := range []JournalKind{KindCmd, KindEvt} {
+		for _, s := range ListSegments(dir, k, f) {
+			if s.Start < n {
+				if err := os.Remove(s.Path); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// clearJournalDir: a fresh (non-append) pipeline owns its directory's journals.
+func clearJournalDir(dir string, f JournalFormat) error {
+	if err := removeSegmentsBelow(dir, f, ^uint64(0)); err != nil {
+		return err
+	}
+	return removeCheckpointsBelow(dir, ^uint64(0))
+}
+
+// writeDurably writes contents to path: temporary name, sync, rename, sync the directory.
+func writeDurably(path string, contents []byte) error {
+	tmp := path + ".tmp"
+	fh, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := fh.Write(contents); err != nil {
+		fh.Close()
+		return err
+	}
+	if err := fh.Sync(); err != nil {
+		fh.Close()
+		return err
+	}
+	if err := fh.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return nil
 }
 
 const (
@@ -571,16 +914,21 @@ type ChunkWriter struct {
 	cur              int
 	last, records    uint64
 	toIO, free       chan int
+	rotations        chan *os.File
 	done             chan struct{}
 	finished         bool
 	err              atomic.Pointer[string]
 }
 
-const stopChunk = -1
+const (
+	stopChunk   = -1
+	rotateChunk = -2
+)
 
 func newChunkWriter(f *os.File, fsync *FsyncPolicy, flushed, durable *atomic.Uint64) *ChunkWriter {
 	w := &ChunkWriter{f: f, fsync: fsync, flushed: flushed, durable: durable, cs: make([]chunk, chunks),
-		toIO: make(chan int, chunks+2), free: make(chan int, chunks+2), done: make(chan struct{})}
+		toIO: make(chan int, chunks+64), free: make(chan int, chunks+2), done: make(chan struct{}),
+		rotations: make(chan *os.File, 64)}
 	for i := range w.cs {
 		w.cs[i].buf = make([]byte, 0, chunkSize)
 		if i > 0 {
@@ -639,6 +987,15 @@ func (w *ChunkWriter) handOff() {
 	w.records = 0
 	w.toIO <- w.cur
 	w.cur = <-w.free
+}
+
+// rotate continues in next (a new segment, header written): everything so
+// far goes to the current file, which the I/O goroutine syncs per policy and
+// closes (spec/JOURNAL.md §6 step 2).
+func (w *ChunkWriter) rotate(next *os.File) {
+	w.handOff()
+	w.rotations <- next
+	w.toIO <- rotateChunk
 }
 
 // finish writes and (per policy) syncs everything; the first I/O error, if any.
@@ -712,6 +1069,22 @@ func (w *ChunkWriter) ioLoop() {
 			if m == stopChunk {
 				stop = true
 				break
+			}
+			if m == rotateChunk {
+				if unsynced > 0 && w.fsync != nil && w.fsync.Mode != FsyncNever {
+					w.sync(written)
+				}
+				unsynced = 0
+				if err := w.f.Close(); err != nil {
+					w.setErr("journal close: " + err.Error())
+				}
+				w.f = <-w.rotations
+				select {
+				case m = <-w.toIO:
+					continue
+				default:
+					break drain
+				}
 			}
 			w.write(m)
 			written = w.cs[m].last

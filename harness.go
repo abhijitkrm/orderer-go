@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/abhijitkrm/orderer-go/matcher"
 )
@@ -182,19 +183,62 @@ func CommonArgs(a *Args) Common {
 	return c
 }
 
+// RunOpts are spec/HARNESS.md §4.1's options beyond the common ones.
+type RunOpts struct {
+	Snapshot        bool
+	CheckpointEvery int  // --checkpoint-every K (1.2); 0 = off
+	Durable         bool // --durable (1.2)
+}
+
 // RunCorpus runs a corpus through a fresh pipeline (one producer, file order),
 // drains, optionally snapshots, and shuts down. It returns the spec/HARNESS.md §3 listing.
 func RunCorpus(c *Corpus, com Common, tagged, snapshot bool) (string, *Snapshot) {
+	return RunCorpusOpts(c, com, tagged, RunOpts{Snapshot: snapshot})
+}
+
+// RunCorpusOpts is RunCorpus with the 1.2 options.
+func RunCorpusOpts(c *Corpus, com Common, tagged bool, opts RunOpts) (string, *Snapshot) {
+	snapshot := opts.Snapshot
 	f, events := Collect(tagged)
 	b := NewBuilder(NewFifoCore).BookConfig(c.Book).PartitionMap(com.Map).Egress(f)
 	if com.Journal != nil {
-		b.Journal(*com.Journal)
+		j := *com.Journal
+		if opts.Durable {
+			j.Fsync = FsyncEveryNPolicy(64)
+			var mu sync.Mutex
+			b.Egress(func(ctx *EgressCtx) Egress {
+				last := uint64(0)
+				return Acks(func(p uint32, m *EvtMsg) {
+					if m.Iseq != last {
+						last = m.Iseq
+						mu.Lock()
+						fmt.Fprintf(os.Stderr, "acked %d %d\n", p, m.Iseq)
+						mu.Unlock()
+					}
+				})(ctx)
+			})
+		}
+		b.Journal(j)
+	} else if opts.Durable || opts.CheckpointEvery > 0 {
+		Die("--durable and --checkpoint-every need --journal-dir")
 	}
 	p, err := b.Build()
 	if err != nil {
 		Die(err.Error())
 	}
-	if p.PublishBatch(c.Cmds) != Ok {
+	if k := opts.CheckpointEvery; k > 0 {
+		for off := 0; off < len(c.Cmds); off += k {
+			n := min(k, len(c.Cmds)-off)
+			if p.PublishBatch(c.Cmds[off:off+n]) != Ok {
+				Fail("pipeline closed")
+			}
+			if n == k {
+				if _, err := p.Checkpoint(); err != nil {
+					Fail(err.Error())
+				}
+			}
+		}
+	} else if p.PublishBatch(c.Cmds) != Ok {
 		Fail("pipeline closed")
 	}
 	if err := p.Drain(); err != nil {

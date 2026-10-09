@@ -5,7 +5,7 @@
 The Go implementation of [orderer](https://github.com/abhijitkrm/orderer):
 an LMAX-Disruptor-style, multi-core order-matching engine around the
 [matcher](https://github.com/abhijitkrm/matcher) order book. It needs Go
-1.21+ and nothing else, and implements `orderer-spec/1.1`. It is a port of
+1.21+ and nothing else, and implements `orderer-spec/1.2`. It is a port of
 [orderer-rust](https://github.com/abhijitkrm/orderer-rust), and
 **byte-identical** to it: listings, per-partition journals (JSONL and
 binary), snapshots and exit codes.
@@ -45,14 +45,15 @@ The runnable version is `examples/quickstart` (`go run ./examples/quickstart`).
 | Routing | `PartitionMap` | hash (spec/ROUTING.md) + table overrides |
 | Journals | `JournalConfig`, `FsyncPolicy` | JSONL or binary, group-commit fsync on I/O goroutines |
 | Waiting | `Waits` / `disruptor.WaitStrategy` | BusySpin, Yield, Backoff, Blocking |
-| Recovery | `Recover`, `ReadSnapshot`, `Restore` | snapshot + journals → cores at any P |
+| Recovery | `Recover`, `ReadSnapshot`, `Restore`, `RepairDir` | snapshot + journals → cores at any P; torn tails repaired |
+| Checkpoints | `Pipeline.Checkpoint` | durable snapshot + journal segment rotation; old segments removed |
 
 ## Build, test, harness
 
 ```bash
 go test ./...                       # ring, golden, pipeline, allocation suites
 go test -race ./...
-scripts/test.sh                     # all of the above + vectors through the harness tools
+scripts/test.sh                     # all of the above + the vendored spec/conformance.sh
 scripts/build-harness.sh            # → harness/bin/{orderrun,ordererfuzz,orderrecover,ordersnap,orderbench}
 CHECKED=1 scripts/build-harness.sh  # the same, under the race detector
 scripts/vendored.sh                 # vendored spec/ + vectors/ untouched

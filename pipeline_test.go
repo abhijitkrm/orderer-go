@@ -192,7 +192,9 @@ func TestJournalsSnapshotAndRecoveryRoundTrip(t *testing.T) {
 				m, _ := NewPartitionMap(rp, nil)
 				var replayed []string
 				rec, err := Recover(NewFifoCore, cfg, m, snap, &JournalSource{dir, fm},
-					func(_ uint32, s uint32, seq uint64, ev *matcher.Event) { replayed = append(replayed, canonSym(seq, s, ev)) })
+					func(_ uint32, s uint32, seq uint64, ev *matcher.Event) {
+						replayed = append(replayed, canonSym(seq, s, ev))
+					})
 				mustOk(t, err)
 				if rec.SnapshotIseq != cut || rec.LastIseq != uint64(len(cmds)) || rec.Replayed != uint64(len(cmds)-cut) {
 					t.Errorf("recovery %+v", rec)
@@ -270,6 +272,7 @@ func TestTornAndCorruptJournalsAreErrors(t *testing.T) {
 				back[off+i] = 0
 			}
 			back[off] = 1
+			seal(back[off:off+CmdRecord], CmdRecordV1) // well-formed, just out of order
 		} else {
 			back = append(back, `{"cmd":"cancel","symbol":0,"order_id":1,"iseq":3}`+"\n"...)
 		}
@@ -507,5 +510,176 @@ func TestSteadyStateAllocations(t *testing.T) {
 	t.Logf("%.2f allocations per command", perCmd)
 	if perCmd > 4 {
 		t.Errorf("%.2f allocations per command", perCmd)
+	}
+}
+
+// ---- 1.2: checksums, repair, checkpoints -------------------------------------------------------
+
+func TestCRC32CMatchesTheSpecCheckValue(t *testing.T) {
+	if CRC32C([]byte("123456789")) != 0xE3069283 {
+		t.Fatal("check value")
+	}
+}
+
+func TestChecksumsCatchFlippedBitsAnywhere(t *testing.T) {
+	dir := scratch(t)
+	p, err := NewBuilder(NewFifoCore).BookConfig(fuzzCfg()).Journal(jcfg(dir, Binary)).Build()
+	mustOk(t, err)
+	p.PublishBatch(fuzzCorpus(9, 300, 2))
+	mustOk(t, p.Shutdown())
+	path := JournalPath(dir, KindCmd, 0, Binary)
+	bad, _ := os.ReadFile(path)
+	bad[Header+100*CmdRecord+20] ^= 0x10
+	mustOk(t, os.WriteFile(path, bad, 0o644))
+	if _, _, err := ReadCmdDir(dir, Binary); err == nil || !strings.Contains(err.Error(), "checksum") {
+		t.Errorf("strict: %v", err)
+	}
+	if _, err := RepairDir(dir, Binary); err == nil {
+		t.Error("mid-file damage is not repairable")
+	}
+}
+
+func TestRepairCutsOnlyATornTail(t *testing.T) {
+	cmds := fuzzCorpus(10, 400, 3)
+	for _, fm := range []JournalFormat{Jsonl, Binary} {
+		dir := scratch(t)
+		p, err := NewBuilder(NewFifoCore).BookConfig(fuzzCfg()).Journal(jcfg(dir, fm)).Build()
+		mustOk(t, err)
+		p.PublishBatch(cmds)
+		mustOk(t, p.Shutdown())
+		path := JournalPath(dir, KindCmd, 0, fm)
+		good, _ := os.ReadFile(path)
+		_, all, err := ReadCmdDir(dir, fm)
+		mustOk(t, err)
+		full := all[0]
+		mustOk(t, os.WriteFile(path, good[:len(good)-5], 0o644))
+		if _, _, err := ReadCmdDir(dir, fm); err == nil {
+			t.Error("strict rejects a torn tail")
+		}
+		if fixed, err := RepairDir(dir, fm); err != nil || len(fixed) != 1 {
+			t.Fatalf("repair: %v %v", fixed, err)
+		}
+		_, got, err := ReadCmdDir(dir, fm)
+		mustOk(t, err)
+		if !reflect.DeepEqual(got[0], full[:len(full)-1]) {
+			t.Error("a prefix survives")
+		}
+		if fm == Binary {
+			zeroed := append([]byte(nil), good...)
+			for i := len(zeroed) - CmdRecord; i < len(zeroed); i++ {
+				zeroed[i] = 0
+			}
+			mustOk(t, os.WriteFile(path, zeroed, 0o644))
+			if fixed, err := RepairDir(dir, fm); err != nil || len(fixed) != 1 {
+				t.Errorf("a complete record that never reached the disk: %v %v", fixed, err)
+			}
+		}
+		if fixed, err := RepairDir(dir, fm); err != nil || len(fixed) != 0 {
+			t.Errorf("a clean file is left alone: %v %v", fixed, err)
+		}
+	}
+}
+
+func TestCheckpointsRotateSegmentsAndBoundRecovery(t *testing.T) {
+	cfg := fuzzCfg()
+	cmds := fuzzCorpus(12, 3000, 6)
+	for _, fm := range []JournalFormat{Jsonl, Binary} {
+		dir := scratch(t)
+		f, h := Collect(true)
+		p, err := NewBuilder(NewFifoCore).BookConfig(cfg).Partitions(3).Journal(jcfg(dir, fm)).Egress(f).Build()
+		mustOk(t, err)
+		p.PublishBatch(cmds[:1000])
+		c1, err := p.Checkpoint()
+		mustOk(t, err)
+		p.PublishBatch(cmds[1000:2200])
+		c2, err := p.Checkpoint()
+		mustOk(t, err)
+		p.PublishBatch(cmds[2200:])
+		mustOk(t, p.Shutdown())
+		if c1.Iseq != 1000 || c2.Iseq != 2200 {
+			t.Errorf("cuts %d %d", c1.Iseq, c2.Iseq)
+		}
+		cps := ListCheckpoints(dir, true, ^uint64(0))
+		if len(cps) != 1 || cps[0].Cut != 2200 {
+			t.Fatalf("checkpoints %v", cps)
+		}
+		for _, k := range []JournalKind{KindCmd, KindEvt} {
+			segs := ListSegments(dir, k, fm)
+			if len(segs) != 3 {
+				t.Errorf("segments %v", segs)
+			}
+			for _, s := range segs {
+				if s.Start != 2200 {
+					t.Errorf("stale segment %s", s.Path)
+				}
+			}
+		}
+		if c2.Body != referenceSnapshot(cfg, cmds, 2200) {
+			t.Error("checkpoint body")
+		}
+		snap, err := ReadSnapshot(cps[0].Path)
+		mustOk(t, err)
+		m, _ := NewPartitionMap(3, nil)
+		var replayed []string
+		rec, err := Recover(NewFifoCore, cfg, m, snap, &JournalSource{dir, fm},
+			func(_ uint32, s uint32, q uint64, ev *matcher.Event) { replayed = append(replayed, canonSym(q, s, ev)) })
+		mustOk(t, err)
+		all := referenceLines(cfg, cmds)
+		prefix := len(referenceLines(cfg, cmds[:2200]))
+		if rec.Replayed != uint64(len(cmds)-2200) || !reflect.DeepEqual(replayed, all[prefix:]) {
+			t.Error("recover from the checkpoint")
+		}
+		var evts []string
+		for q := uint32(0); q < 3; q++ {
+			e, err := ReadEvtPartition(dir, fm, q)
+			mustOk(t, err)
+			evts = append(evts, e...)
+		}
+		want := append([]string(nil), all[prefix:]...)
+		sort.Strings(evts)
+		sort.Strings(want)
+		if !reflect.DeepEqual(evts, want) {
+			t.Error("event segments hold the tail")
+		}
+		if len(lines(h.Listing())) != len(all) {
+			t.Error("listing")
+		}
+	}
+}
+
+func TestAppendContinuesTheLastSegmentAfterACheckpoint(t *testing.T) {
+	cfg := fuzzCfg()
+	cmds := fuzzCorpus(14, 2000, 4)
+	dir := scratch(t)
+	j := jcfg(dir, Binary)
+	p, err := NewBuilder(NewFifoCore).BookConfig(cfg).Partitions(2).Journal(j).Build()
+	mustOk(t, err)
+	p.PublishBatch(cmds[:800])
+	_, err = p.Checkpoint()
+	mustOk(t, err)
+	p.PublishBatch(cmds[800:1200])
+	mustOk(t, p.Shutdown())
+	m, _ := NewPartitionMap(2, nil)
+	snap, err := ReadSnapshot(ListCheckpoints(dir, true, ^uint64(0))[0].Path)
+	mustOk(t, err)
+	rec, err := Recover(NewFifoCore, cfg, m, snap, &JournalSource{dir, Binary}, func(uint32, uint32, uint64, *matcher.Event) {})
+	mustOk(t, err)
+	if rec.LastIseq != 1200 {
+		t.Fatalf("last iseq %d", rec.LastIseq)
+	}
+	j.Append = true
+	p, err = NewBuilder(NewFifoCore).BookConfig(rec.Book).PartitionMap(m).Journal(j).Initial(rec.Initial()).Build()
+	mustOk(t, err)
+	p.PublishBatch(cmds[1200:])
+	s, err := p.Snapshot()
+	mustOk(t, err)
+	mustOk(t, p.Shutdown())
+	if s.Iseq != 2000 || s.Body != referenceSnapshot(cfg, cmds, 2000) {
+		t.Error("resumed state")
+	}
+	_, recs, err := ReadCmdDir(dir, Binary)
+	mustOk(t, err)
+	if n := len(recs[0]) + len(recs[1]); n != 1200 {
+		t.Errorf("%d records; 800 should be checkpointed away", n)
 	}
 }

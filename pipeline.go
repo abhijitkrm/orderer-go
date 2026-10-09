@@ -136,6 +136,7 @@ type sharedState struct {
 	flushed, durable   []*atomic.Uint64
 	alertsMu           sync.Mutex
 	alerts             []func()
+	journal            *JournalConfig
 }
 
 func (sh *sharedState) addAlert(a func()) {
@@ -386,13 +387,45 @@ func (p *Pipeline) Drain() error {
 }
 
 // Snapshot is a consistent snapshot of every book, cut at this point of the ingress order.
-func (p *Pipeline) Snapshot() (*Snapshot, error) {
+func (p *Pipeline) Snapshot() (*Snapshot, error) { return p.snapshotOp(CtlSnapshot) }
+
+// Checkpoint is a snapshot cut at this point of the ingress order; every
+// journal rotates onto a new segment at the cut; the snapshot is written
+// durably into the journal directory; older segments and checkpoints are
+// removed (spec/JOURNAL.md §6).
+func (p *Pipeline) Checkpoint() (*Snapshot, error) {
+	cfg := p.sh.journal
+	if cfg == nil {
+		return nil, &Error{ErrConfig, "checkpoint needs journals"}
+	}
+	s, err := p.snapshotOp(CtlCheckpoint)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.Drain(); err != nil { // every egress has rotated its event journal
+		return nil, err
+	}
+	path := CheckpointPath(cfg.Dir, s.Iseq)
+	for _, step := range []func() error{
+		func() error { return writeDurably(path, []byte(s.Body)) },
+		func() error { return writeDurably(MetaPath(path), []byte(s.Meta())) },
+		func() error { return removeSegmentsBelow(cfg.Dir, cfg.Format, s.Iseq) },
+		func() error { return removeCheckpointsBelow(cfg.Dir, s.Iseq) },
+	} {
+		if err := step(); err != nil {
+			return nil, &Error{ErrIO, err.Error()}
+		}
+	}
+	return s, nil
+}
+
+func (p *Pipeline) snapshotOp(ctl Control) (*Snapshot, error) {
 	sh := p.sh
 	op := sh.nextOp.Add(1)
 	sh.snapsMu.Lock()
 	sh.snaps[op] = &snapState{remaining: sh.partitions}
 	sh.snapsMu.Unlock()
-	if err := p.publishCtl(CtlSnapshot, op); err != nil {
+	if err := p.publishCtl(ctl, op); err != nil {
 		return nil, err
 	}
 	sh.snapsMu.Lock()
@@ -473,11 +506,36 @@ type egressPart struct {
 	stopped  bool
 }
 
+// segmenter opens a partition's next journal segment (spec/JOURNAL.md §6 step 2).
+type segmenter struct {
+	dir           string
+	format        JournalFormat
+	kind          JournalKind
+	p, partitions uint32
+	book          matcher.BookConfig
+}
+
+func (s *segmenter) rotate(w *ChunkWriter, cut uint64) error {
+	f, err := openSegment(s.dir, s.format, s.kind, s.p, s.partitions, s.book, cut)
+	if err != nil {
+		return err
+	}
+	w.rotate(f)
+	return nil
+}
+
 // evtJournal is the event journal as the first plug of its partition.
 type evtJournal struct {
 	w           *ChunkWriter
 	f           JournalFormat
+	seg         segmenter
 	lastHandoff time.Time
+}
+
+func (e *evtJournal) OnCheckpoint(cut uint64) {
+	if err := e.seg.rotate(e.w, cut); err != nil {
+		panic("event journal rotate: " + err.Error())
+	}
 }
 
 func (e *evtJournal) OnEvent(m *EvtMsg) { e.w.pushEvt(e.f, m.Seq, m.Symbol, &m.Ev) }
@@ -525,6 +583,7 @@ func (b *Builder) Build() (*Pipeline, error) {
 		egressEpoch: make([]paddedU64, P), snaps: map[uint64]*snapState{}}
 	sh.snapsCond = sync.NewCond(&sh.snapsMu)
 	sh.timestamps.Store(b.timestamps)
+	sh.journal = b.journal
 	for i := uint32(0); i < P; i++ {
 		f, d := &atomic.Uint64{}, &atomic.Uint64{}
 		f.Store(startWm)
@@ -541,7 +600,10 @@ func (b *Builder) Build() (*Pipeline, error) {
 	if journaled {
 		jc := b.journal
 		var err error
-		if err = os.MkdirAll(jc.Dir, 0o755); err == nil {
+		if err = os.MkdirAll(jc.Dir, 0o755); err == nil && !jc.Append {
+			err = clearJournalDir(jc.Dir, jc.Format)
+		}
+		if err == nil {
 			for i := uint32(0); i < P && err == nil; i++ {
 				var f *os.File
 				if f, err = openJournal(jc, KindCmd, i, P, b.book); err != nil {
@@ -589,12 +651,16 @@ func (b *Builder) Build() (*Pipeline, error) {
 		sh.addAlert(octl.Alert)
 
 		eng := &engine{sh: sh, inbox: icons[0], out: outbox, core: cores[i], journal: cmdW[i], fmt: fmtp}
+		if journaled {
+			eng.seg = segmenter{b.journal.Dir, b.journal.Format, KindCmd, i, P, b.book}
+		}
 		pl.spawn("engine", eng.run)
 
 		ctx := &EgressCtx{Partition: i, Partitions: P, Epoch: sh.epoch, durable: sh.durable[i]}
 		part := &egressPart{p: i, outbox: ocons[0], ctx: ctx}
 		if evtW[i] != nil {
-			part.plugs = append(part.plugs, &evtJournal{w: evtW[i], f: b.journal.Format, lastHandoff: time.Now()})
+			part.plugs = append(part.plugs, &evtJournal{w: evtW[i], f: b.journal.Format, lastHandoff: time.Now(),
+				seg: segmenter{b.journal.Dir, b.journal.Format, KindEvt, i, P, b.book}})
 		}
 		for _, f := range b.egress {
 			part.plugs = append(part.plugs, f(ctx))
@@ -677,6 +743,7 @@ type engine struct {
 	core        MatchingCore
 	journal     *ChunkWriter
 	fmt         *JournalFormat
+	seg         segmenter
 	iseq, tPub  uint64
 	stop, force bool
 }
@@ -698,7 +765,13 @@ func (e *engine) onCmd(m *CmdMsg, _ int64, eob bool) {
 		e.iseq, e.tPub = m.Iseq, m.TPub
 		e.core.Apply(m.Symbol, &m.Cmd, e)
 	} else {
-		if m.Ctl == CtlSnapshot {
+		// the new segment starts at this cut, before the snapshot is reported
+		if m.Ctl == CtlCheckpoint && e.journal != nil {
+			if err := e.seg.rotate(e.journal, m.Iseq); err != nil {
+				panic("journal rotate: " + err.Error())
+			}
+		}
+		if m.Ctl == CtlSnapshot || m.Ctl == CtlCheckpoint {
 			blocks := e.core.SnapshotBlocks(nil)
 			e.sh.snapsMu.Lock()
 			if st := e.sh.snaps[m.Arg]; st != nil {
@@ -771,6 +844,12 @@ func egressLoop(sh *sharedState, parts []*egressPart, journaled bool) error {
 			sh.egressEpoch[ep.p].v.Store(m.Arg)
 		case CtlShutdown:
 			stop = true
+		case CtlCheckpoint:
+			for _, pl := range ep.plugs {
+				if c, ok := pl.(Checkpointer); ok {
+					c.OnCheckpoint(m.Iseq)
+				}
+			}
 		}
 		if eob {
 			for _, pl := range ep.plugs {

@@ -20,6 +20,7 @@ const (
 	CtlBarrier
 	CtlSnapshot
 	CtlShutdown
+	CtlCheckpoint
 )
 
 // CmdMsg is the ingress / inbox slot.
@@ -57,6 +58,12 @@ type Egress interface {
 	OnBatchEnd()       // after a ring batch / before a drain completes
 	OnIdle()           // while idle: release gated work
 	OnShutdown() error // once, after every event
+}
+
+// Checkpointer is an optional Egress hook: a checkpoint with cut `cut`
+// passed the partition (1.2). The event journal starts a new segment there.
+type Checkpointer interface {
+	OnCheckpoint(cut uint64)
 }
 
 // EgressBase supplies no-op hooks for embedding.

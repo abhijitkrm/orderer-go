@@ -1,11 +1,13 @@
 // orderrecover — spec/HARNESS.md §4.3 (mirrors matcherrecover).
 //
 //	orderrecover <snapshot> <tail-file> [--partitions P] [--partition-map F]
-//	orderrecover --journal-dir DIR [--snap PATH] [--binary] [--partitions P] [--partition-map F]
+//	orderrecover --journal-dir DIR [--snap PATH] [--binary] [--repair] [--partitions P] [--partition-map F]
 //
 // Tail form: restore, submit every tail line without "format" through a
 // pipeline, print the replayed events. Journal form: recover from journals
-// (after the optional snapshot's cut). Malformed/corrupt input exits 2.
+// (after the optional snapshot's cut; by default the directory's newest
+// checkpoint). Malformed/corrupt input exits 2; --repair first truncates torn
+// tails (spec/JOURNAL.md §5.1).
 package main
 
 import (
@@ -61,8 +63,22 @@ func tailForm(snapPath, tailPath string, pmap *orderer.PartitionMap) {
 	orderer.Print(events.Listing())
 }
 
-func journalForm(dir string, snapPath string, hasSnap bool, f orderer.JournalFormat, pmap *orderer.PartitionMap) {
+func journalForm(dir string, snapPath string, hasSnap bool, f orderer.JournalFormat, repair bool, pmap *orderer.PartitionMap) {
 	parts := make([][]byte, pmap.Partitions())
+	if repair {
+		fixed, err := orderer.RepairDir(dir, f)
+		if err != nil {
+			orderer.Die(err.Error())
+		}
+		for _, r := range fixed {
+			fmt.Fprintf(os.Stderr, "repaired %s %d\n", r.Path, r.Bytes)
+		}
+	}
+	if !hasSnap {
+		if cps := orderer.ListCheckpoints(dir, true, ^uint64(0)); len(cps) > 0 {
+			snapPath, hasSnap = cps[len(cps)-1].Path, true
+		}
+	}
 	var snap *orderer.Snapshot
 	if hasSnap {
 		var err error
@@ -87,8 +103,8 @@ func journalForm(dir string, snapPath string, hasSnap bool, f orderer.JournalFor
 
 func main() {
 	usage := "orderrecover <snapshot> <tail-file> [--partitions P] [--partition-map F]\n" +
-		"       orderrecover --journal-dir DIR [--snap PATH] [--binary] [--partitions P] [--partition-map F]"
-	a := orderer.ParseArgs(os.Args[1:], usage, []string{"--partitions", "--partition-map", "--journal-dir", "--snap"}, []string{"--binary"})
+		"       orderrecover --journal-dir DIR [--snap PATH] [--binary] [--repair] [--partitions P] [--partition-map F]"
+	a := orderer.ParseArgs(os.Args[1:], usage, []string{"--partitions", "--partition-map", "--journal-dir", "--snap"}, []string{"--binary", "--repair"})
 	pmap := orderer.PartitionMapArg(a)
 	dir, hasDir := a.Get("--journal-dir")
 	snapPath, hasSnap := a.Get("--snap")
@@ -98,8 +114,8 @@ func main() {
 		if a.Flag("--binary") {
 			f = orderer.Binary
 		}
-		journalForm(dir, snapPath, hasSnap, f, pmap)
-	case !hasDir && len(a.Positional) == 2 && !hasSnap && !a.Flag("--binary"):
+		journalForm(dir, snapPath, hasSnap, f, a.Flag("--repair"), pmap)
+	case !hasDir && len(a.Positional) == 2 && !hasSnap && !a.Flag("--binary") && !a.Flag("--repair"):
 		tailForm(a.Positional[0], a.Positional[1], pmap)
 	default:
 		orderer.Die(usage)
