@@ -26,9 +26,17 @@ harness build is a race build.
 
 ## Goroutines
 
-The router, each engine and each egress group run on their own goroutine
-with `runtime.LockOSThread`, so a busy-spinning stage keeps a thread and the
-scheduler does not migrate it. Panics in a stage are recovered and fail the
+The router, each engine and each egress group run on their own goroutine.
+They are **not** locked to OS threads. Locking (`runtime.LockOSThread`) was
+the first design, meant to keep a busy-spinning stage on one thread, but it
+made throughput erratic. A locked goroutine that yields or blocks must hand
+its P to another thread and wake its own thread to resume; with the spinners
+filling most of the M1's 8 cores, those handoffs decided the run. Measured
+on W6 10M with journals off, locked vs unlocked: P=2 5.8–8.6M vs 10.5–13.3M,
+P=4 8.1–16.9M vs 16.0–17.2M, P=1 4.4–5.1M vs 5.7–6.3M; durable rows and
+latency unchanged. Busy-spin waits also yield the P every 16K idle spins
+(see `disruptor.go`), so journal goroutines returning from fsync get a P
+promptly. Panics in a stage are recovered and fail the
 pipeline (drain, snapshot and shutdown then return an `ErrFailed` error),
 as orderer-rust does with thread panics.
 

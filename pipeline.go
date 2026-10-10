@@ -12,7 +12,7 @@ package orderer
 // events into outbox[p].
 // egress (grouped): runs the plugs, marks drain epochs.
 // I/O goroutines (one per journal file, inside ChunkWriter): write + fsync.
-// Router, engine and egress goroutines lock their OS threads.
+// Router, engine and egress are ordinary goroutines (not locked to OS threads).
 
 import (
 	"errors"
@@ -771,13 +771,14 @@ func (p *Pipeline) checkpointLoop(d time.Duration) {
 	}
 }
 
-// spawn runs body on its own locked OS thread; a returned error or panic fails the pipeline.
+// spawn runs body on its own goroutine; a returned error or panic fails the
+// pipeline. Not LockOSThread: a locked goroutine that yields or blocks hands
+// its P to another thread and back, and on an 8-core M1 that made pipeline
+// throughput swing by 2x between runs (DESIGN.md, Goroutines).
 func (p *Pipeline) spawn(name string, body func() error) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
 		defer func() {
 			if r := recover(); r != nil {
 				p.sh.fail(fmt.Sprintf("%s thread failed: %v", name, r))

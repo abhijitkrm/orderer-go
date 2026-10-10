@@ -167,7 +167,6 @@ func pipeMode(core orderer.CoreFactory, setup, run *orderer.Corpus, o *pipeOpts)
 		done.Add(1)
 		go func() {
 			defer done.Done()
-			runtime.LockOSThread()
 			ready.Done()
 			start.Wait()
 			for i := 0; i < len(s); i += o.batch {
