@@ -328,5 +328,5 @@ func main() {
 	fmt.Printf("| %s | %s | %s | %s | %d | %.0f | %s | %d | %d | %d | %d | %d | %d | %s |\n", tag, mode, P, prod, r.ops,
 		opsS, eff, mean, pct(r.lat, 0.5), pct(r.lat, 0.9), pct(r.lat, 0.99), pct(r.lat, 0.999), maxLat,
 		strings.Join(config, " "))
-	fmt.Fprintf(os.Stderr, "env: %s / orderer-go 0.2.0 / %s\n", cpu(), runtime.Version())
+	fmt.Fprintf(os.Stderr, "env: %s / orderer-go 0.2.1 / %s\n", cpu(), runtime.Version())
 }

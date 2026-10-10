@@ -5,7 +5,7 @@
 The Go implementation of [orderer](https://github.com/abhijitkrm/orderer):
 an LMAX-Disruptor-style, multi-core order-matching engine around the
 [matcher](https://github.com/abhijitkrm/matcher) order book. It needs Go
-1.21+ and nothing else, and implements `orderer-spec/1.2`. It is a port of
+1.21+ and nothing else, and implements `orderer-spec/1.3`. It is a port of
 [orderer-rust](https://github.com/abhijitkrm/orderer-rust), and
 **byte-identical** to it: listings, per-partition journals (JSONL and
 binary), snapshots and exit codes.
@@ -19,7 +19,7 @@ Handle.Publish ─▶ ingress ─▶ router ─┬─▶ inbox[p] ─▶ engine[
 ## Install
 
 ```bash
-go get github.com/abhijitkrm/orderer-go@v0.2.0
+go get github.com/abhijitkrm/orderer-go@v0.2.1
 ```
 
 ## Quick start
