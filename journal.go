@@ -1,6 +1,7 @@
 package orderer
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -533,6 +534,11 @@ func splitBody(p string, b []byte, f JournalFormat, mode ReadMode) (body, error)
 		if (len(b)-Header)%size != 0 && mode == Strict {
 			return out, corrupt(p, "torn tail (partial record)")
 		}
+		if mode == Repair { // 1.3: zero records an interrupted write left (§5.1)
+			for n > 0 && allZero(b[Header+(n-1)*size:Header+n*size]) {
+				n--
+			}
+		}
 		if h.Version >= 2 {
 			for i := 0; i < n; i++ {
 				at := Header + i*size
@@ -726,41 +732,95 @@ type Repaired struct {
 }
 
 // RepairDir truncates a torn tail off each journal family's last segment, in
-// place (spec/JOURNAL.md §5.1).
+// place, after deleting trailing segments a crash left without a usable
+// header (spec/JOURNAL.md §5.1, 1.3).
 func RepairDir(dir string, f JournalFormat) ([]Repaired, error) {
 	var out []Repaired
 	for _, k := range []JournalKind{KindCmd, KindEvt} {
-		last := map[uint32]string{}
+		segs := map[uint32][]Segment{}
 		var parts []uint32
 		for _, s := range ListSegments(dir, k, f) {
-			if _, ok := last[s.Partition]; !ok {
+			if _, ok := segs[s.Partition]; !ok {
 				parts = append(parts, s.Partition)
 			}
-			last[s.Partition] = s.Path
+			segs[s.Partition] = append(segs[s.Partition], s)
 		}
 		for _, p := range parts {
-			path := last[p]
-			b, err := readFile(path)
-			if err != nil {
-				return out, err
-			}
-			bd, err := splitBody(path, b, f, Repair)
-			if err != nil {
-				return out, err
-			}
-			if bd.validLen < len(b) {
-				if err := os.Truncate(path, int64(bd.validLen)); err != nil {
+			ss := segs[p]
+			sort.Slice(ss, func(i, j int) bool { return ss[i].Start < ss[j].Start })
+			// drop trailing segments without a usable header; the segment
+			// before becomes the last
+			for len(ss) > 0 && ss[len(ss)-1].Start > 0 {
+				path := ss[len(ss)-1].Path
+				b, err := readFile(path)
+				if err != nil {
+					return out, err
+				}
+				if !headerless(path, b, f) {
+					break
+				}
+				if err := os.Remove(path); err != nil {
 					return out, corrupt(path, err.Error())
 				}
-				if fh, err := os.OpenFile(path, os.O_WRONLY, 0); err == nil {
-					fh.Sync()
-					fh.Close()
+				if d, err := os.Open(dir); err == nil {
+					d.Sync()
+					d.Close()
 				}
-				out = append(out, Repaired{path, int64(len(b) - bd.validLen)})
+				out = append(out, Repaired{path, int64(len(b))})
+				ss = ss[:len(ss)-1]
+			}
+			// repair the last segment; while it holds no records, the one
+			// before it too (its writer may still have been finishing it)
+			for i := len(ss) - 1; i >= 0; i-- {
+				path := ss[i].Path
+				b, err := readFile(path)
+				if err != nil {
+					return out, err
+				}
+				bd, err := splitBody(path, b, f, Repair)
+				if err != nil {
+					return out, err
+				}
+				if bd.validLen < len(b) {
+					if err := os.Truncate(path, int64(bd.validLen)); err != nil {
+						return out, corrupt(path, err.Error())
+					}
+					if fh, err := os.OpenFile(path, os.O_WRONLY, 0); err == nil {
+						fh.Sync()
+						fh.Close()
+					}
+					out = append(out, Repaired{path, int64(len(b) - bd.validLen)})
+				}
+				if len(bd.records) > 0 {
+					break
+				}
 			}
 		}
 	}
 	return out, nil
+}
+
+// headerless: a segment that cannot hold a record (spec/JOURNAL.md 1.3
+// §5.1) — JSONL with no newline at all, or binary with an invalid header and
+// nothing but zeros after it.
+func headerless(path string, b []byte, f JournalFormat) bool {
+	if f == Jsonl {
+		return bytes.IndexByte(b, '\n') < 0
+	}
+	if len(b) > Header && !allZero(b[Header:]) {
+		return false
+	}
+	_, err := parseBinaryHeader(path, b)
+	return err != nil
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // MergeJournals is one iseq-ordered stream of records after `after`; iseqs must be disjoint.

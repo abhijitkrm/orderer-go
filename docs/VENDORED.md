@@ -10,8 +10,8 @@ matcher's spec and corpus.
 
 - **upstream**: `orderer`
 - **repo**: `https://github.com/abhijitkrm/orderer`
-- **commit**: `6a46583cf1fc3aee1e5c2c935143b14d8d716067`
-- **tag**: `orderer-spec/1.2`, plus matcher `06b5403` (bench docs only)
+- **commit**: `f54438147277b8834eba0b3facde71b5356f81c7`
+- **tag**: `orderer-spec/1.3`
 - **paths**: `spec=spec vectors=vectors`
 
 `docs/VENDORED.sha256` holds every file's checksum. `scripts/vendored.sh`
