@@ -310,6 +310,22 @@ func (h *Handle) Close() {
 // ---- Builder --------------------------------------------------------------------------------
 
 // Builder configures a Pipeline.
+// EgressPlacement says where the egress plugs run.
+type EgressPlacement uint8
+
+const (
+	// EgressThread runs them on egress goroutines fed by a per-partition
+	// outbox ring (the default).
+	EgressThread EgressPlacement = iota
+	// EgressInline runs them on the engine goroutine, right after each command
+	// is applied: no outbox ring, no egress goroutine, no per-event copy. Plugs
+	// run on the engine's critical path, so keep them cheap. Requires journals
+	// off (ErrConfig otherwise): the event journal and the ack gating on
+	// durability are egress-goroutine work. Plugs see the same events in the
+	// same order.
+	EgressInline
+)
+
 type Builder struct {
 	core                   CoreFactory
 	book                   matcher.BookConfig
@@ -321,6 +337,7 @@ type Builder struct {
 	egress                 []EgressFactory
 	timestamps             bool
 	egressThreads          int
+	egressPlacement        EgressPlacement
 	initial                *Initial
 	checkpointEvery        time.Duration
 }
@@ -354,6 +371,12 @@ func (b *Builder) CheckpointEvery(d time.Duration) *Builder { b.checkpointEvery 
 
 func (b *Builder) Initial(i Initial) *Builder { b.initial = &i; return b }
 
+// EgressPlace sets where the egress plugs run (default EgressThread).
+func (b *Builder) EgressPlace(p EgressPlacement) *Builder {
+	b.egressPlacement = p
+	return b
+}
+
 // EgressThreads sets the goroutines running the partitions' egress plugs (partition p → p % n).
 func (b *Builder) EgressThreads(n int) *Builder {
 	b.egressThreads = max(n, 1)
@@ -385,6 +408,14 @@ func (p *Pipeline) SetTimestamps(on bool)                         { p.sh.timesta
 func (p *Pipeline) DurableIseq(part uint32) uint64                { return p.sh.durable[part].Load() }
 
 // Stats is a point-in-time view of the pipeline (see stats.go).
+// outboxDepth is a partition's outbox backlog; inline egress has no outbox.
+func outboxDepth(sh *sharedState, i uint32, depth func(pub, con int64) uint64) uint64 {
+	if int(i) >= len(sh.outboxCtl) {
+		return 0
+	}
+	return depth(sh.outboxCtl[i].Published(), sh.outboxCtl[i].Consumed())
+}
+
 func (p *Pipeline) Stats() PipelineStats {
 	sh := p.sh
 	depth := func(pub, con int64) uint64 {
@@ -403,7 +434,7 @@ func (p *Pipeline) Stats() PipelineStats {
 		st.Partitions = append(st.Partitions, PartitionStats{
 			Partition:    i,
 			InboxDepth:   depth(sh.inboxCtl[i].Published(), sh.inboxCtl[i].Consumed()),
-			OutboxDepth:  depth(sh.outboxCtl[i].Published(), sh.outboxCtl[i].Consumed()),
+			OutboxDepth:  outboxDepth(sh, i, depth),
 			Commands:     sh.counters[i].commands.Load(),
 			Events:       sh.counters[i].events.Load(),
 			FlushedIseq:  flushed,
@@ -609,6 +640,10 @@ func (b *Builder) Build() (*Pipeline, error) {
 	if b.checkpointEvery > 0 && b.journal == nil {
 		return nil, &Error{ErrConfig, "CheckpointEvery needs journals"}
 	}
+	inlineEgress := b.egressPlacement == EgressInline
+	if inlineEgress && b.journal != nil {
+		return nil, &Error{ErrConfig, "inline egress requires journals off (the event journal and ack gating run on egress goroutines)"}
+	}
 	pmap := b.pmap
 	if pmap == nil {
 		m, err := NewPartitionMap(b.partitions, nil)
@@ -703,33 +738,45 @@ func (b *Builder) Build() (*Pipeline, error) {
 		sh.addAlert(ictl.Alert)
 		inboxes[i] = inbox
 
-		ob := disruptor.NewRingBuilder[EvtMsg](b.outbox)
-		ob.Consumer(b.waits.Egress)
-		outbox, ocons := ob.BuildSingle()
-		octl := outbox.Control()
-		sh.outboxCtl = append(sh.outboxCtl, octl)
-		sh.addAlert(octl.Alert)
+		var outbox *disruptor.SingleProducer[EvtMsg]
+		var ocons []*disruptor.Consumer[EvtMsg]
+		if !inlineEgress {
+			ob := disruptor.NewRingBuilder[EvtMsg](b.outbox)
+			ob.Consumer(b.waits.Egress)
+			outbox, ocons = ob.BuildSingle()
+			octl := outbox.Control()
+			sh.outboxCtl = append(sh.outboxCtl, octl)
+			sh.addAlert(octl.Alert)
+		}
 
-		eng := &engine{sh: sh, inbox: icons[0], out: outbox, core: cores[i], journal: cmdW[i], fmt: fmtp, counters: sh.counters[i]}
+		ctx := &EgressCtx{Partition: i, Partitions: P, Epoch: sh.epoch, durable: sh.durable[i]}
+		var plugs []Egress
+		if evtW[i] != nil {
+			plugs = append(plugs, &evtJournal{w: evtW[i], f: b.journal.Format, lastHandoff: time.Now(),
+				seg: segmenter{b.journal.Dir, b.journal.Format, KindEvt, i, P, b.book}})
+		}
+		for _, f := range b.egress {
+			plugs = append(plugs, f(ctx))
+		}
+
+		eng := &engine{sh: sh, inbox: icons[0], out: outbox, core: cores[i], journal: cmdW[i], fmt: fmtp, counters: sh.counters[i], p: i}
+		if inlineEgress {
+			eng.inline, eng.iplugs = true, plugs
+		}
 		if journaled {
 			eng.seg = segmenter{b.journal.Dir, b.journal.Format, KindCmd, i, P, b.book}
 		}
 		pl.spawn("engine", eng.run)
 
-		ctx := &EgressCtx{Partition: i, Partitions: P, Epoch: sh.epoch, durable: sh.durable[i]}
-		part := &egressPart{p: i, outbox: ocons[0], ctx: ctx}
-		if evtW[i] != nil {
-			part.plugs = append(part.plugs, &evtJournal{w: evtW[i], f: b.journal.Format, lastHandoff: time.Now(),
-				seg: segmenter{b.journal.Dir, b.journal.Format, KindEvt, i, P, b.book}})
+		if !inlineEgress {
+			groups[int(i)%nEgress] = append(groups[int(i)%nEgress], &egressPart{p: i, outbox: ocons[0], ctx: ctx, plugs: plugs})
 		}
-		for _, f := range b.egress {
-			part.plugs = append(part.plugs, f(ctx))
-		}
-		groups[int(i)%nEgress] = append(groups[int(i)%nEgress], part)
 	}
-	for _, g := range groups {
-		g := g
-		pl.spawn("egress", func() error { return egressLoop(sh, g, journaled) })
+	if !inlineEgress {
+		for _, g := range groups {
+			g := g
+			pl.spawn("egress", func() error { return egressLoop(sh, g, journaled) })
+		}
 	}
 	rb := disruptor.NewRingBuilder[CmdMsg](b.ingress)
 	rb.Consumer(b.waits.Router)
@@ -839,11 +886,23 @@ type engine struct {
 	counters    *engineCounters
 	nCommands   uint64
 	nEvents     uint64
+	// inline egress: out is nil and the plugs run here
+	inline  bool
+	iplugs  []Egress
+	p       uint32
+	scratch EvtMsg
 }
 
 // Emit stages one event into the outbox.
 func (e *engine) Emit(sym uint32, seq uint64, ev *matcher.Event) {
 	e.nEvents++
+	if e.inline { // no outbox, no copy, no hop
+		e.scratch = EvtMsg{Iseq: e.iseq, Seq: seq, TPub: e.tPub, Symbol: sym, Ev: *ev}
+		for _, pl := range e.iplugs {
+			pl.OnEvent(&e.scratch)
+		}
+		return
+	}
 	s := e.out.Stage()
 	if s == nil {
 		panic("outbox alerted")
@@ -887,12 +946,32 @@ func (e *engine) onCmd(m *CmdMsg, _ int64, eob bool) {
 		} else {
 			e.force = true
 		}
-		if s := e.out.Stage(); s != nil {
+		if e.inline { // what the egress goroutine does for a control
+			switch m.Ctl {
+			case CtlBarrier:
+				for _, pl := range e.iplugs {
+					pl.OnBatchEnd()
+					pl.OnIdle()
+				}
+				e.sh.egressEpoch[e.p].v.Store(m.Arg)
+			case CtlCheckpoint:
+				for _, pl := range e.iplugs {
+					if c, ok := pl.(Checkpointer); ok {
+						c.OnCheckpoint(m.Iseq)
+					}
+				}
+			}
+		} else if s := e.out.Stage(); s != nil {
 			*s = EvtMsg{Iseq: m.Iseq, Arg: m.Arg, Ctl: m.Ctl}
 		}
 	}
 	if eob {
-		e.out.Commit()
+		if e.out != nil {
+			e.out.Commit()
+		}
+		for _, pl := range e.iplugs {
+			pl.OnBatchEnd()
+		}
 	}
 }
 
@@ -905,6 +984,24 @@ func (e *engine) run() error {
 		if n > 0 {
 			e.counters.commands.Store(e.nCommands)
 			e.counters.events.Store(e.nEvents)
+		}
+		if e.inline {
+			if e.stop {
+				var first error
+				for _, pl := range e.iplugs {
+					pl.OnIdle()
+					if err := pl.OnShutdown(); err != nil && first == nil {
+						first = err
+					}
+				}
+				if first != nil {
+					return first
+				}
+			} else if n == 0 {
+				for _, pl := range e.iplugs {
+					pl.OnIdle()
+				}
+			}
 		}
 		if e.stop || e.inbox.IsAlerted() {
 			break
@@ -920,7 +1017,9 @@ func (e *engine) run() error {
 			e.inbox.ResetIdle()
 		}
 	}
-	e.out.Commit()
+	if e.out != nil {
+		e.out.Commit()
+	}
 	return nil
 }
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `EgressPlacement` (`Builder.EgressPlace`, `EgressInline`; default `EgressThread`): the
+  engine goroutine runs the egress plugs itself, with no outbox ring, egress
+  goroutine or per-event copy. Journals must be off (`ErrConfig` otherwise). Same
+  events, same order (`TestInlineEgress*`, also under `-race`). `orderbench
+  --egress thread|inline`. Journals-off pipeline, real core P=4, M1: 17.6M ->
+  29.5M (latency off), 17.3M -> 24.3M (protocol).
 - `orderbench --latency on|off`. `off` stops stamping and sampling commands, which
   the BENCH.md protocol does with two clock reads per command; default `on`.
   Journals-off pipeline, M1: P=2 no-op core 30.5M -> 31.8M, real core P=4 17.3M

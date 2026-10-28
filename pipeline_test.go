@@ -764,3 +764,69 @@ func TestStatsCountCommandsEventsAndFsyncs(t *testing.T) {
 	}
 	mustOk(t, p.Shutdown())
 }
+
+// ---- inline egress ----------------------------------------------------------------------
+
+func runPlaced(t *testing.T, cfg matcher.BookConfig, cmds []SymCmd, P uint32, place EgressPlacement) [][]string {
+	f, h := Collect(true)
+	p, err := NewBuilder(NewFifoCore).BookConfig(cfg).Partitions(P).RingSizes(1<<10, 1<<8, 1<<8).
+		EgressPlace(place).Egress(f).Build()
+	mustOk(t, err)
+	p.PublishBatch(cmds)
+	mustOk(t, p.Drain())
+	mustOk(t, p.Shutdown())
+	var out [][]string
+	for _, b := range h.Take() {
+		out = append(out, lines(b))
+	}
+	return out
+}
+
+func TestInlineEgressMatchesThreadEgress(t *testing.T) {
+	cfg := fuzzCfg()
+	for seed := uint64(1); seed <= 6; seed++ {
+		cmds := fuzzCorpus(seed, 4000, 8)
+		for _, P := range []uint32{1, 2, 3, 4, 7} {
+			threaded := runPlaced(t, cfg, cmds, P, EgressThread)
+			inlined := runPlaced(t, cfg, cmds, P, EgressInline)
+			if !reflect.DeepEqual(inlined, threaded) {
+				t.Errorf("seed %d P=%d: inline egress changed the per-partition streams", seed, P)
+			}
+			if !dense(concat(inlined)) {
+				t.Errorf("seed %d P=%d: seq density", seed, P)
+			}
+		}
+	}
+}
+
+func TestInlineEgressRequiresJournalsOff(t *testing.T) {
+	j := NewJournalConfig(scratch(t), Binary)
+	_, err := NewBuilder(NewFifoCore).BookConfig(fuzzCfg()).Partitions(2).Journal(j).EgressPlace(EgressInline).Build()
+	var e *Error
+	if !errors.As(err, &e) || e.Kind != ErrConfig || !strings.Contains(e.Msg, "inline egress") {
+		t.Fatalf("inline egress with journals must be refused, got %v", err)
+	}
+}
+
+func TestInlineEgressHasStatsWithoutAnOutbox(t *testing.T) {
+	cmds := fuzzCorpus(5, 2000, 8)
+	p, err := NewBuilder(NewFifoCore).BookConfig(fuzzCfg()).Partitions(3).EgressPlace(EgressInline).Build()
+	mustOk(t, err)
+	p.PublishBatch(cmds)
+	mustOk(t, p.Drain())
+	st := p.Stats()
+	if len(st.Partitions) != 3 {
+		t.Fatalf("partitions %d", len(st.Partitions))
+	}
+	var total uint64
+	for _, s := range st.Partitions {
+		if s.OutboxDepth != 0 {
+			t.Errorf("outbox depth %d without an outbox", s.OutboxDepth)
+		}
+		total += s.Commands
+	}
+	if total != uint64(len(cmds)) {
+		t.Errorf("commands %d != %d", total, len(cmds))
+	}
+	mustOk(t, p.Shutdown())
+}
