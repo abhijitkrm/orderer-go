@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `orderbench --latency on|off`. `off` stops stamping and sampling commands, which
+  the BENCH.md protocol does with two clock reads per command; default `on`.
+  Journals-off pipeline, M1: P=2 no-op core 30.5M -> 31.8M, real core P=4 17.3M
+  -> 17.5M, so Go's pipeline is not clock-bound.
+
 ## 0.2.1 (orderer-spec/1.3)
 
 - Vendors matcher-go 81542be: the price ladder finds the next best price through a

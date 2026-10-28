@@ -113,6 +113,7 @@ type pipeOpts struct {
 	journal                *orderer.JournalConfig
 	waits                  orderer.Waits
 	ingress, inbox, outbox int
+	latency                bool
 	stats                  bool
 }
 
@@ -156,7 +157,7 @@ func pipeMode(core orderer.CoreFactory, setup, run *orderer.Corpus, o *pipeOpts)
 		streams[k] = append(streams[k], sc)
 	}
 	runtime.GC()
-	p.SetTimestamps(true)
+	p.SetTimestamps(o.latency)
 	var ready, start sync.WaitGroup
 	var done sync.WaitGroup
 	start.Add(1)
@@ -221,10 +222,10 @@ func cpu() string {
 func main() {
 	usage := "orderbench <prefix> --mode core|pipe [--partitions P] [--producers N] [--journal binary|jsonl|off] " +
 		"[--journal-dir DIR] [--fsync N] [--tag NAME] [--core fifo|noop] [--waits relaxed|low] [--batch N] " +
-		"[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS] [--stats]"
+		"[--ingress N] [--inbox N] [--outbox N] [--events on|off] [--baseline OPS] [--latency on|off] [--stats]"
 	a := orderer.ParseArgs(os.Args[1:], usage, []string{"--mode", "--partitions", "--producers", "--journal",
 		"--journal-dir", "--fsync", "--tag", "--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox",
-		"--events", "--baseline"}, []string{"--stats"})
+		"--events", "--baseline", "--latency"}, []string{"--stats"})
 	if len(a.Positional) != 1 {
 		orderer.Die(usage)
 	}
@@ -252,7 +253,14 @@ func main() {
 		o := &pipeOpts{partitions: uint32(a.Num("--partitions", 1, orderer.MaxPartitions)),
 			producers: int(max(a.Num("--producers", 1, 1024), 1)), batch: int(max(a.Num("--batch", 64, 1<<20), 1)),
 			waits: orderer.LowLatencyWaits(), ingress: 1 << 14, inbox: 1 << 12, outbox: 1 << 13,
-			stats: a.Flag("--stats")}
+			stats: a.Flag("--stats"), latency: true}
+		switch get("--latency", "on") {
+		case "on":
+		case "off":
+			o.latency = false
+		default:
+			orderer.Die("--latency: unknown " + get("--latency", ""))
+		}
 		o.ingress = int(a.Num("--ingress", uint64(o.ingress), 1<<30))
 		o.inbox = int(a.Num("--inbox", uint64(o.inbox), 1<<30))
 		o.outbox = int(a.Num("--outbox", uint64(o.outbox), 1<<30))
@@ -284,7 +292,7 @@ func main() {
 			orderer.Die("--waits: unknown " + get("--waits", ""))
 		}
 		config = append(config, fmt.Sprintf("journal=%s fsync=%d", jm, fsync))
-		for _, k := range []string{"--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events"} {
+		for _, k := range []string{"--core", "--waits", "--batch", "--ingress", "--inbox", "--outbox", "--events", "--latency"} {
 			if v, ok := a.Get(k); ok {
 				config = append(config, k[2:]+"="+v)
 			}
