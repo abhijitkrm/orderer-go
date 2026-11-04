@@ -41,3 +41,10 @@ state role=Follower term=3 leader=- commit=0 applied=0 base=0 last=2
 The election timeout jitter comes from a xorshift64* generator seeded as
 `splitmix64(seed ^ (id << 56))`, so a port needs the same generator
 (`orderer-consensus/src/rng.rs`) for identical timings.
+
+## Who replays these
+
+orderer-rust (`orderer-consensus` `trace::replay`, and `tracegen` checks every
+file it writes), orderer-cpp (`tests/replication_test.cpp`), orderer-go
+(`consensus/consensus_test.go`), orderer-java (`ReplicationTest`) and
+orderer-ts (`tests/replication.ts`). All five reproduce all 28 traces.

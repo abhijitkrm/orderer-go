@@ -406,10 +406,24 @@ it does not scale.
   so a large book pauses applying (not consensus) while it serialises.
 * Throughput on real multi-machine hardware, with a real NIC and NVMe, and
   Linux fsync behaviour. Everything above is one laptop.
-* The replication runtime (WAL, snapshots, transport, replica, client) in
-  C++, Java, Go and TypeScript. Only the protocol core is ported, and only
-  to the languages named in `vectors/replication/README.md`, each proved
-  against the shared conformance vectors there.
+* The replication **runtime** (WAL, snapshots, transport, replica, client,
+  sessions, authentication) exists only in orderer-rust. C++, Go, Java and
+  TypeScript have the **protocol core** only (§13.9); each still needs its own
+  storage, network and client layers.
 * `unsafe` was added in one place, behind the `hwcrc` feature (runtime CPU
   detection, tested equal to the portable code): the third sanctioned site
   after `affinity` and `prefetch`.
+
+### 13.9 Ports
+
+The protocol core (`Node`: elections, replication, compaction, snapshot
+install) is ported to **C++** (`orderer-cpp/include/orderer/consensus.hpp`),
+**Go** (`orderer-go/consensus`), **Java** (`orderer-java` `Consensus`) and
+**TypeScript** (`orderer-ts/src/consensus.ts`). Each replays all 28 traces in
+`vectors/replication/` (28,000 recorded drain points: elections won,
+pre-votes, replication, truncation, applies, compactions, snapshot requests,
+installs, restores and crash-restart stanzas) and must reproduce every
+recorded effect and state line byte for byte; each port's test also fails when
+a vector line is altered. The ports have no simulator of their own: the
+vectors carry what the Rust simulator exercised, and no more. A behaviour the
+simulator never reached is not covered in any port.
