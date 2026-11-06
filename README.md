@@ -54,6 +54,19 @@ The runnable version is `examples/quickstart` (`go run ./examples/quickstart`).
 | Recovery | `Recover`, `ReadSnapshot`, `Restore`, `RepairDir` | snapshot + journals → cores at any P; torn tails repaired |
 | Checkpoints | `Pipeline.Checkpoint` | durable snapshot + journal segment rotation; old segments removed |
 
+## Replication
+
+`consensus` is the replication protocol core (a pure state machine) and
+`cluster` the runtime around it: write-ahead log, snapshots, TCP transport
+with optional pre-shared-key authentication, a replica that drives the
+pipeline as a replicated state machine, and a leader-following client with
+exactly-once sessions and linearizable `Barrier`. `cmd/orderernode` runs one
+replica as a process, with the same command line and protocol as orderer-rust's
+`orderer-node` and orderer-cpp's `orderer_node`: replicas of all three
+languages can share one cluster (`scripts/interop.sh`), and WAL and snapshot
+files are byte-identical. `cmd/clusterbench` measures throughput. Design,
+proofs and numbers: `spec/REPLICATION.md` §13.12.
+
 ## Build, test, harness
 
 ```bash

@@ -231,6 +231,9 @@ func (n *Node) entryAt(i Index) (Entry, bool) {
 	return Entry{}, false
 }
 
+// EntryAt is the log entry at index i, if the node still holds it.
+func (n *Node) EntryAt(i Index) (Entry, bool) { return n.entryAt(i) }
+
 // ---- inputs ----
 
 func (n *Node) Tick() {
