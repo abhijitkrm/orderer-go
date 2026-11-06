@@ -5,8 +5,9 @@
 - `consensus` package: the replication protocol core (`spec/REPLICATION.md`) as a pure state machine, ported from orderer-rust and proved against the shared conformance vectors (`vectors/replication/`: 28 traces, 28,000 recorded drain points, byte-identical effects and state).
 - `cluster` package: the replication runtime, ported from orderer-rust and orderer-cpp (`spec/REPLICATION.md` 13.12). WAL and snapshot store (byte-identical to Rust's, against `vectors/replication-wire/`), TCP transport with the pre-shared-key handshake and per-frame MAC, replica (driver, WAL and applier goroutines, back-pressure, digest-based divergence halt, compaction and snapshot install), client protocol with exactly-once sessions and linearizable `Barrier`, `RecorderSm`, `DedupSm` and `PipelineSm` (the matching pipeline as the replicated state machine, same state digest as Rust and C++). 19 end-to-end tests, race-clean; mixed Go/Rust/C++ clusters survive `kill -9` of the leader and cross-language snapshot transfer (`scripts/interop.sh`).
 - `cmd/orderernode` (one replica as a process, same command line as the Rust and C++ nodes) and `cmd/clusterbench` (same flags and output as orderer-rust's). 3 nodes, no-op state machine: 17.2M commands/s, level with Rust; with the matching pipeline 4.2M against Rust's 11.0M (the Go matcher and pipeline, not the replication path).
+- Scale-out: `ShardMap`, `ShardedClient` (one leader-following client per replica group; group assignment checked against independently computed values; two groups tested end to end incl. one group's outage). `cmd/orderload`: the port of `orderer-load` (`run`, `status`, `settle`, `verify`); `scripts/interop.sh` uses it by default.
 - `consensus.Node.EntryAt`.
-- Vendored spec and vectors re-pinned to orderer 5461246 (adds `vectors/replication-wire/`).
+- Vendored spec and vectors re-pinned to orderer ae0ed4a (adds `vectors/replication-wire/`).
 
 - `EgressPlacement` (`Builder.EgressPlace`, `EgressInline`; default `EgressThread`): the
   engine goroutine runs the egress plugs itself, with no outbox ring, egress

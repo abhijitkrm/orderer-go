@@ -12,7 +12,11 @@
 #   COMPACT=100 DOWN=5 scripts/interop.sh     # force snapshot transfer between languages
 #   SM=recorder scripts/interop.sh            # language-neutral recorder instead of the matching pipeline
 #
-# Needs ../orderer-rust (built here with cargo); ../orderer-cpp only when IMPLS names cpp.
+#   LOADER=rust scripts/interop.sh            # drive it with orderer-rust's orderer-load instead of orderload
+#
+# The load tool is orderload (this repo) unless LOADER=rust. Needs ../orderer-rust
+# (built here with cargo) only when IMPLS names rust or LOADER=rust; ../orderer-cpp
+# only when IMPLS names cpp.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -20,6 +24,7 @@ IMPLS=${IMPLS:-"go rust go"}
 SECS=${SECS:-25}
 KILLS=${KILLS:-5}
 SM=${SM:-pipeline}
+LOADER=${LOADER:-go}
 COMPACT=${COMPACT:-0}   # >0: snapshot and compact the log every N entries
 DOWN=${DOWN:-1}         # seconds a killed leader stays down
 BASE=${BASE_PORT:-48900}
@@ -30,11 +35,16 @@ read -r -a KINDS <<< "$IMPLS"
 N=${#KINDS[@]}
 
 TMP=$(mktemp -d)
-(cd "$RUST" && cargo build --release -q -p orderer-cluster --bin orderer-node --bin orderer-load)
 RUST_NODE="$RUST/target/release/orderer-node"
-LOAD="$RUST/target/release/orderer-load"
+if [[ " $IMPLS " == *" rust "* || "$LOADER" == rust ]]; then
+  (cd "$RUST" && cargo build --release -q -p orderer-cluster --bin orderer-node --bin orderer-load)
+fi
 GO_NODE="$TMP/orderernode"
 go build -o "$GO_NODE" ./cmd/orderernode
+if [[ "$LOADER" == rust ]]; then LOAD="$RUST/target/release/orderer-load"; else
+  LOAD="$TMP/orderload"
+  go build -o "$LOAD" ./cmd/orderload
+fi
 CPP_NODE="$CPP/build/orderer_node"
 if [[ " $IMPLS " == *" cpp "* ]]; then
   cmake -S "$CPP" -B "$CPP/build" -DCMAKE_BUILD_TYPE=Release >/dev/null

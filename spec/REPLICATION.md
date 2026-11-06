@@ -409,8 +409,7 @@ it does not scale.
 * The replication **runtime** (WAL, snapshots, transport, replica, client,
   sessions, authentication) exists in orderer-rust, orderer-cpp (§13.10) and
   orderer-go (§13.12). Java and TypeScript have the **protocol core** only
-  (§13.9); each still needs its own storage, network and client layers. The Go
-  port has no scale-out client (`ShardMap`, `ShardedClient`) yet.
+  (§13.9); each still needs its own storage, network and client layers.
 * `unsafe` was added in one place, behind the `hwcrc` feature (runtime CPU
   detection, tested equal to the portable code): the third sanctioned site
   after `affinity` and `prefetch`.
@@ -522,6 +521,16 @@ function for function, and `cmd/orderernode` takes the same command line as
   in the same order, exactly once, and replicas of all languages ended with the
   same state digest. With `COMPACT=100 DOWN=5` on go-rust-cpp, three snapshot
   installs crossed language boundaries and the digests still agreed.
+
+Go also has the scale-out client (`ShardMap`, `ShardedClient`; the group
+assignment is checked against values computed independently from the splitmix64
+definition, and two groups are tested end to end, including one group's outage
+leaving the other serving) and `orderload`, the port of `orderer-load` with the
+same modes and output. `interop.sh` drives clusters with `orderload` by default
+(`LOADER=rust` for Rust's): the mixed clusters above pass with it, including
+rust-go-cpp and go-rust-cpp with authentication and forced snapshot transfer (6
+installs, all across languages), and `orderload verify` fails, with exit status
+1, on a lost, duplicated, invented, reordered and divergent applied log.
 
 Throughput, `orderer-go`'s `clusterbench` (same flags and output line as the
 others) against orderer-rust's, interleaved on the §13.6 machine, which was

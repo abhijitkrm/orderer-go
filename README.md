@@ -64,7 +64,7 @@ exactly-once sessions and linearizable `Barrier`. `cmd/orderernode` runs one
 replica as a process, with the same command line and protocol as orderer-rust's
 `orderer-node` and orderer-cpp's `orderer_node`: replicas of all three
 languages can share one cluster (`scripts/interop.sh`), and WAL and snapshot
-files are byte-identical. `cmd/clusterbench` measures throughput. Design,
+files are byte-identical. `ShardMap` / `ShardedClient` scale out over independent groups; `cmd/orderload` is the load generator and failover verifier (`run`, `status`, `settle`, `verify`); `cmd/clusterbench` measures throughput. Design,
 proofs and numbers: `spec/REPLICATION.md` §13.12.
 
 ## Build, test, harness
