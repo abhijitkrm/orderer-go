@@ -1,6 +1,7 @@
 package orderer
 
 import (
+	"math/bits"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -261,3 +262,131 @@ func Metrics(sampleCapacity int) (EgressFactory, *MetricsHandle) {
 			Latencies: make([]uint64, 0, sampleCapacity)}, h: h}
 	}, h
 }
+
+// ---- EventDigest: a rolling hash of each partition's event stream -----------------------
+
+// ChainStep is one step of the event-chain hash: rotl((h ^ x) * K, 31). Pinned
+// exactly (spec/REPLICATION.md 13.16): replicas of different languages compare
+// these values.
+func ChainStep(h, x uint64) uint64 {
+	return bits.RotateLeft64((h^x)*0x9E3779B97F4A7C15, 31)
+}
+
+// ChainEvent folds one event into a chain: the causing command's iseq, the
+// symbol and event kind, the per-book sequence, then the kind's fields.
+// Reasons are coded explicitly and signed prices as two's-complement uint64.
+func ChainEvent(h uint64, m *EvtMsg) uint64 {
+	e := &m.Ev
+	var kind uint64
+	switch e.Kind {
+	case matcher.EvAccepted:
+		kind = 1
+	case matcher.EvRejected:
+		kind = 2
+	case matcher.EvTrade:
+		kind = 3
+	case matcher.EvClosed:
+		kind = 4
+	default:
+		kind = 5
+	}
+	h = ChainStep(h, m.Iseq)
+	h = ChainStep(h, uint64(m.Symbol)<<8|kind)
+	h = ChainStep(h, m.Seq)
+	switch e.Kind {
+	case matcher.EvAccepted:
+		h = ChainStep(h, e.OrderID)
+		return ChainStep(h, e.LeavesQty)
+	case matcher.EvRejected:
+		var code uint64
+		switch matcher.RejectReason(e.Reason) {
+		case matcher.InvalidQty:
+			code = 0
+		case matcher.InvalidPrice:
+			code = 1
+		case matcher.DuplicateOrderID:
+			code = 2
+		case matcher.UnknownOrderID:
+			code = 3
+		case matcher.PostOnlyWouldCross:
+			code = 4
+		case matcher.FokCannotFill:
+			code = 5
+		default:
+			code = 6
+		}
+		h = ChainStep(h, e.OrderID)
+		return ChainStep(h, code)
+	case matcher.EvTrade:
+		h = ChainStep(h, e.Maker)
+		h = ChainStep(h, e.Taker)
+		h = ChainStep(h, uint64(e.Price))
+		return ChainStep(h, e.Qty)
+	case matcher.EvClosed:
+		var code uint64
+		switch matcher.CloseReason(e.Reason) {
+		case matcher.Filled:
+			code = 0
+		case matcher.Cancelled:
+			code = 1
+		default:
+			code = 2
+		}
+		h = ChainStep(h, e.OrderID)
+		return ChainStep(h, code)
+	default:
+		h = ChainStep(h, e.OrderID)
+		h = ChainStep(h, uint64(e.Price))
+		return ChainStep(h, e.Qty)
+	}
+}
+
+// EventDigest keeps one rolling hash per partition over the events it emits.
+// Replicas fed the same commands emit the same events, so their chains agree and
+// a divergence in behaviour makes them differ. Reading is O(partitions): no
+// snapshot of the books. It does not see state that has not yet influenced an
+// event. It is an EgressFactory; register it with Builder.Egress(d.Factory()).
+type EventDigest struct {
+	slots []paddedU64
+}
+
+// NewEventDigest starts each partition's chain at the given value (zeros for a
+// fresh pipeline, the snapshot's values after a restore).
+func NewEventDigest(partitions uint32, initial []uint64) *EventDigest {
+	d := &EventDigest{slots: make([]paddedU64, partitions)}
+	for i := range d.slots {
+		if i < len(initial) {
+			d.slots[i].v.Store(initial[i])
+		}
+	}
+	return d
+}
+
+// Values is every partition's chain, as of the last pipeline drain.
+func (d *EventDigest) Values() []uint64 {
+	out := make([]uint64, len(d.slots))
+	for i := range d.slots {
+		out[i] = d.slots[i].v.Load()
+	}
+	return out
+}
+
+// Factory is the egress factory to register with the builder.
+func (d *EventDigest) Factory() EgressFactory {
+	return func(ctx *EgressCtx) Egress {
+		slot := &d.slots[ctx.Partition].v
+		return &digestEgress{h: slot.Load(), slot: slot}
+	}
+}
+
+type digestEgress struct {
+	h    uint64
+	slot *atomic.Uint64
+}
+
+func (e *digestEgress) OnEvent(m *EvtMsg) { e.h = ChainEvent(e.h, m) }
+
+// Published at batch ends and before a drain completes, not per event.
+func (e *digestEgress) OnBatchEnd()       { e.slot.Store(e.h) }
+func (e *digestEgress) OnIdle()           {}
+func (e *digestEgress) OnShutdown() error { e.slot.Store(e.h); return nil }

@@ -474,7 +474,7 @@ func (r *Replica) applierLoop() {
 			r.smApplied.Store(uint64(j.index))
 		case aHash:
 			at := consensus.Index(r.smApplied.Load())
-			d, ok := r.sm.Digest(at)
+			d, ok := r.sm.DeepDigest(at)
 			j.hashReply <- hashAnswer{at, d, ok}
 		case aStop:
 			return

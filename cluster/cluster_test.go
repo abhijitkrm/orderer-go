@@ -65,6 +65,7 @@ func (p probe) Restore(i consensus.Index, d []byte) error {
 	defer p.s.mu.Unlock()
 	return p.s.sm.Restore(i, d)
 }
+func (p probe) DeepDigest(i consensus.Index) (Digest, bool) { return p.Digest(i) }
 func (p probe) Digest(i consensus.Index) (Digest, bool) {
 	p.s.mu.Lock()
 	defer p.s.mu.Unlock()

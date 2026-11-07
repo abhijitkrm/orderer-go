@@ -57,6 +57,9 @@ func putLE(b []byte, v uint64) {
 func (a *audited) Snapshot(i consensus.Index) []byte               { return a.inner.Snapshot(i) }
 func (a *audited) Restore(i consensus.Index, d []byte) error       { return a.inner.Restore(i, d) }
 func (a *audited) Digest(i consensus.Index) (cluster.Digest, bool) { return a.inner.Digest(i) }
+func (a *audited) DeepDigest(i consensus.Index) (cluster.Digest, bool) {
+	return a.inner.DeepDigest(i)
+}
 
 func main() {
 	id := flag.Int("id", -1, "node id")

@@ -35,6 +35,9 @@ func (noop) Apply(consensus.Index, consensus.Entry)        {}
 func (noop) Snapshot(consensus.Index) []byte               { return nil }
 func (noop) Restore(consensus.Index, []byte) error         { return nil }
 func (noop) Digest(consensus.Index) (cluster.Digest, bool) { return cluster.Digest{}, false }
+func (noop) DeepDigest(consensus.Index) (cluster.Digest, bool) {
+	return cluster.Digest{}, false
+}
 
 var workdir string
 

@@ -17,8 +17,13 @@ type StateMachine interface {
 	Snapshot(index consensus.Index) []byte
 	// Restore replaces the state with a snapshot taken at index.
 	Restore(index consensus.Index, data []byte) error
-	// Digest is a digest of the state, for divergence detection; ok=false means unsupported.
+	// Digest is a digest of the state, for the periodic comparison between replicas
+	// (divergence detection); ok=false means unsupported. Keep it cheap.
 	Digest(index consensus.Index) (Digest, bool)
+	// DeepDigest is a digest of the whole state, however expensive, for on-demand
+	// checks (the client protocol's state hash). Implementations without a
+	// cheaper Digest return the same value as Digest.
+	DeepDigest(index consensus.Index) (Digest, bool)
 }
 
 type recorded struct {
@@ -69,6 +74,8 @@ func (r *RecorderSm) Restore(_ consensus.Index, d []byte) error {
 func (r *RecorderSm) Digest(consensus.Index) (Digest, bool) {
 	return sha256.Sum256(r.serialize()), true
 }
+
+func (r *RecorderSm) DeepDigest(i consensus.Index) (Digest, bool) { return r.Digest(i) }
 
 // Applied is every recorded entry's index and payload.
 func (r *RecorderSm) Applied() (indexes []consensus.Index, payloads [][]byte) {
@@ -150,6 +157,14 @@ func (d *DedupSm) Restore(index consensus.Index, b []byte) error {
 
 func (d *DedupSm) Digest(index consensus.Index) (Digest, bool) {
 	in, ok := d.inner.Digest(index)
+	if !ok {
+		return Digest{}, false
+	}
+	return sha256.Sum256(append(d.tableBytes(), in[:]...)), true
+}
+
+func (d *DedupSm) DeepDigest(index consensus.Index) (Digest, bool) {
+	in, ok := d.inner.DeepDigest(index)
 	if !ok {
 		return Digest{}, false
 	}
